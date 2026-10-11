@@ -490,6 +490,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
+  # Qwen3.6 step 3: the plain block (hc = 1) composed by the engine against the oracle's dumps of the synthetic file
+  # (docs/qwen36-port/step3-block.md).  Needs the synthetic fixture (python3 with numpy) and a CUDA device.
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT _q36_python STREQUAL "")
+    add_executable(qwen36_block_test tests/cuda/qwen36_block_test.cpp)
+    target_link_libraries(qwen36_block_test PRIVATE strata_engine strata_artifact)
+    add_test(NAME qwen36_block_fixtures
+             COMMAND ${CMAKE_COMMAND} -DPYTHON=${_q36_python} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                     -DSYNTH=${CMAKE_CURRENT_BINARY_DIR}/qwen36_synth -DOUT=${CMAKE_CURRENT_BINARY_DIR}/qwen36_block
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qwen36_block_fixtures.cmake)
+    set_tests_properties(qwen36_block_fixtures PROPERTIES FIXTURES_SETUP qwen36_block_data
+                         FIXTURES_REQUIRED qwen36_synth_data TIMEOUT 300)
+    add_test(NAME qwen36_block_test COMMAND qwen36_block_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_synth
+                                            ${CMAKE_CURRENT_BINARY_DIR}/qwen36_block/o8)
+    set_tests_properties(qwen36_block_test PROPERTIES FIXTURES_REQUIRED "qwen36_synth_data;qwen36_block_data"
+                         SKIP_RETURN_CODE 77 TIMEOUT 120)
+  endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
