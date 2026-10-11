@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -38,6 +40,7 @@ struct Dev {
 std::vector<uint8_t> make_matrix(ggml_type t, int64_t rows, int64_t cols, int expert, int trial) {
     const auto* tr = ggml_get_type_traits(t);
     if (tr == nullptr || tr->from_float_ref == nullptr) throw std::runtime_error("no reference quantizer");
+    ggml_quantize_init(t);   // the i-quant quantizers' lookup tables (a probe of IQ3_XXS faulted without it)
     const size_t rb = ggml_row_size(t, cols);
     std::vector<uint8_t> out((size_t) rows * rb);
     std::vector<float> row((size_t) cols);
@@ -95,6 +98,10 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
     ck(cudaMemcpy(db.p, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice), "bounds");
     ck(cudaMemcpy(dw.p, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
     ck(cudaMemset(dy.p, 0xff, (size_t) rows * (size_t) out_rows * 4), "sentinel");
+    // the copies and the sentinel memset above run on the legacy default stream, which does not order itself before
+    // the non-blocking stream `s`: without this the memset could land after the product's writes (every row then
+    // reads as unwritten, seen on the second product of a run at 2048 x 512 on an RTX 4090)
+    ck(cudaDeviceSynchronize(), "inputs");
     mmq::quantize((const float*) dx.p, (const int32_t*) dsrc.p, dxq.p, (int) t, cols, cols, rows, s);
     mmq::Product p;
     p.w = dw.p; p.type = (int) t; p.w_rows = out_rows; p.w_cols = cols; p.expert_bytes = eb; p.n = n;
@@ -123,8 +130,26 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
         }
     }
     double err2 = 0, ref2 = 0, max_abs = 0, zero_max = 0;
+    {   // which rows went wrong, and whether they were never written (the 0xff sentinel) or computed non-finite
+        size_t unwritten = 0, nonfinite = 0;
+        std::string rows_bad;
+        for (int r = 0; r < rows; ++r) {
+            size_t u = 0, nf = 0;
+            for (int64_t o = 0; o < out_rows; ++o) {
+                const float v = got[(size_t) r * (size_t) out_rows + (size_t) o];
+                uint32_t bits;
+                std::memcpy(&bits, &v, 4);
+                if (bits == 0xffffffffu) ++u;
+                else if (!std::isfinite(v)) ++nf;
+            }
+            unwritten += u; nonfinite += nf;
+            if (u || nf) rows_bad += " row " + std::to_string(r) + " (" + std::to_string(u) + " unwritten, " + std::to_string(nf) + " non-finite)";
+        }
+        if (unwritten || nonfinite)
+            throw std::runtime_error(std::string(name) + ": " + std::to_string(unwritten) + " values unwritten, " +
+                                     std::to_string(nonfinite) + " non-finite:" + rows_bad);
+    }
     for (size_t i = 0; i < got.size(); ++i) {
-        if (!std::isfinite(got[i])) throw std::runtime_error(std::string(name) + ": unwritten or non-finite output");
         const double d = (double) got[i] - ref[i];
         err2 += d * d; ref2 += (double) ref[i] * ref[i]; max_abs = std::max(max_abs, std::fabs(d));
     }
@@ -140,12 +165,25 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         if (mmq::supported(GGML_TYPE_Q3_K)) throw std::runtime_error("Q3_K should not be covered");
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        if (argc > 1) {   // probes: each argument one product TYPE,OUT_ROWS,COLS[,TRIAL] (ggml type id), one context
+            mmq::Context ctx;
+            for (int i = 1; i < argc; ++i) {
+                int t = 0, trial = 0;
+                long long rows = 0, cols = 0;
+                if (std::sscanf(argv[i], "%d,%lld,%lld,%d", &t, &rows, &cols, &trial) < 3) throw std::runtime_error("probe: TYPE,ROWS,COLS[,TRIAL]");
+                std::printf("probe %s %lld x %lld trial %d (fits %d)\n", ggml_type_name((ggml_type) t), rows, cols, trial,
+                            (int) mmq::fits(t, rows));
+                product(ctx, s, argv[i], (ggml_type) t, rows, cols, {1, 3, 3}, trial);
+            }
+            std::printf("probes passed\n");
+            return 0;
+        }
         {
             mmq::Context ctx;
             const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
