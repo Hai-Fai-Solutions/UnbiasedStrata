@@ -2076,6 +2076,12 @@ int main(int argc, char** argv) {
         if (g.arch != strata::core::ModelArch::Qwen4Exp)
             std::fprintf(stderr, "strata generate: model geometry (%s, from the file's metadata):\n%s",
                          o.native_preset.c_str(), strata::core::model_geometry_text(g).c_str());
+        // KV streaming is a lever only for selected attention: with no indexer every cell is read every token
+        // (qsa_state_init refuses as the backstop; this names it before any weight moves)
+        if (o.kv_resident > 0 && !strata::core::qsa_kv_streaming_applies(g, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         // the fused tensor layouts llama.cpp accepts and this engine refuses by name (no shipped file uses them)
         try {
             const strata::GgufModel model(o.native_shards);
