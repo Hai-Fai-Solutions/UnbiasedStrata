@@ -489,6 +489,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_cache_segmented_test PRIVATE strata_engine)
     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # Qwen3.6 step 4: a real native pack loaded as `strata generate --native --pack` loads it (arena, native
+    # projections, head, embedding, check_all), given by STRATA_QWEN36_GGUF / STRATA_QWEN36_PACK; skipped without
+    # them (docs/qwen36-port/step4-pack.md)
+    add_executable(pack_load_check tests/core/pack_load_check.cpp)
+    target_link_libraries(pack_load_check PRIVATE strata_engine)
+    add_test(NAME pack_load_check COMMAND pack_load_check)
+    set_tests_properties(pack_load_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   endif()
   # Qwen3.6 step 3: the plain block (hc = 1) composed by the engine against the oracle's dumps of the synthetic file
   # (docs/qwen36-port/step3-block.md).  Needs the synthetic fixture (python3 with numpy) and a CUDA device.
