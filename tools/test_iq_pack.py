@@ -19,11 +19,13 @@ from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
 import iq_pack
 
 
-def write_gguf(path, tensors, split=None, arch=True):
-    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no)."""
+def write_gguf(path, tensors, split=None, arch=True, kv=None):
+    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no); `kv` = extra u32 keys."""
     writer = GGUFWriter(path, "qwen4exp")
     if not arch:                                   # a later shard of a split: no model metadata
         writer.kv_data[0].pop("general.architecture", None)
+    for key, value in (kv or {}).items():
+        writer.add_uint32(key, value)
     if split is not None:
         writer.add_uint16("split.no", split[0])
         writer.add_uint16("split.count", split[1])
@@ -165,6 +167,72 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(len(rewritten), len(written))
             self.assertNotEqual(rewritten, written)
             self.assertIn("not rewritten", pack(second))
+
+    def test_layout_only_writes_the_table_and_the_census(self):
+        """--layout-only (the Qwen3.6 port's step 2): native_experts.txt alone, the census printed, nothing else."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "m.gguf"
+            write_gguf(path, [("blk.%d.ffn_gate_inp.weight" % l, np.ones((4, 32), np.float32), Q.F32)
+                              for l in range(2)] +
+                             [("blk.%d.ffn_%s_exps.weight" % (l, r),
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)
+                              for l in range(2) for r in ("gate", "up", "down")])
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 0)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["native_experts.txt"])
+            text = (out / "native_experts.txt").read_text()
+            rows = [line.split() for line in text.splitlines() if line and not line.startswith("#")]
+            self.assertEqual([r[0] for r in rows], ["0", "1"])
+            blob = 3 * 2 * 32 * 34 // 32          # gate | up | down, Q8_0 rows of 32 values = 34 bytes
+            self.assertEqual([int(r[4]) for r in rows], [blob, blob])
+            self.assertIn("(n_expert 4, total %d;" % (2 * 4 * blob), text.splitlines()[0])
+            self.assertIn("2 layers x 4 experts", log.getvalue())
+            self.assertIn("gate/up Q8_0     down Q8_0     blob %9d B: layers [0, 1]" % blob, log.getvalue())
+            self.assertIn("wrote %s" % (out / "native_experts.txt"), log.getvalue())
+
+    def test_nextn_block_is_left_out_of_the_layout(self):
+        """nextn_predict_layers 1 (the -MTP files): the last block's experts belong to the drafter's pack."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "mtp.gguf"
+            write_gguf(path, [("blk.%d.ffn_gate_inp.weight" % l, np.ones((4, 32), np.float32), Q.F32)
+                              for l in range(3)] +
+                             [("blk.%d.ffn_%s_exps.weight" % (l, r),
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)
+                              for l in range(3) for r in ("gate", "up", "down")],
+                       kv={"qwen4exp.nextn_predict_layers": 1})
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 0)
+            rows = [line.split() for line in (out / "native_experts.txt").read_text().splitlines()
+                    if line and not line.startswith("#")]
+            self.assertEqual([r[0] for r in rows], ["0", "1"])
+            self.assertIn("1 draft (nextn) block(s) at blk.2 and up are left to the MTP pack; 2 trunk layers", log.getvalue())
+            self.assertIn("2 layers x 4 experts", log.getvalue())
+
+    def test_fused_gate_up_experts_are_refused_by_name(self):
+        """llama.cpp's fused ffn_gate_up_exps form: refused before anything is written."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "fused.gguf"
+            write_gguf(path, [("blk.0.ffn_gate_inp.weight", np.ones((4, 32), np.float32), Q.F32),
+                              ("blk.0.ffn_gate_up_exps.weight",
+                               np.arange(4 * 4 * 32, dtype=np.float32).reshape(4, 4, 32) / 256, Q.Q8_0),
+                              ("blk.0.ffn_down_exps.weight",
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)])
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 1)
+            self.assertIn("blk.0.ffn_gate_up_exps.weight: the experts are fused", log.getvalue())
+            self.assertFalse((out / "native_experts.txt").exists())
 
     def test_snapshot_symlinks_keep_split_discovery(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
