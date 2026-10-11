@@ -19,7 +19,8 @@ engine's arithmetic (FP16 activations, int8 MMQ), not the weights.
 For each case: <out>/<case>.gguf, the oracle's dumps for 40 tokens in <out>/<case>/o (the faithful reading) and
 <out>/<case>/o_q8 (--act-quant q8: the activations rounded as ggml does before a quantized matmul), and the negative
 controls <out>/<case>/neg_<name>: the oracle with one reading flipped to its rival (gdn_gate=sigmoid,
-head_pairing=interleaved, router_norm=False; attn_gate=False on full4).  Exit 3 when numpy or gguf-py is missing.
+head_pairing=interleaved, router_norm=False; attn_gate=False on full4).  Without numpy or gguf-py it writes
+<out>/SKIP with the reason and exits 0, and the test exits 77 on seeing it (a skip, not a failure).
 """
 from __future__ import annotations
 
@@ -40,7 +41,16 @@ try:
     from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
 except ImportError as e:                    # a trimmed third_party or no numpy: a skip, not a failure
     print(f"qwen36_prefill_fixture: {e}", file=sys.stderr)
-    sys.exit(3)
+    out = None
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a == "--out" and i < len(sys.argv) - 1:
+            out = sys.argv[i + 1]
+        elif a.startswith("--out="):
+            out = a[len("--out="):]
+    if out:
+        pathlib.Path(out).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(out) / "SKIP").write_text(f"{e}\n")
+    sys.exit(0)
 
 # 40 tokens: the ASCII codes of this text (the fixture's vocabulary is the 128 byte tokens)
 TEXT = "the quick brown fox jumps over the lazy "

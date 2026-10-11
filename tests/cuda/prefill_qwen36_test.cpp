@@ -15,7 +15,7 @@
 // harness could not tell the readings apart.  Geometry refusals: Prefill::init with top-10 on this 16-expert file,
 // and with a GDN geometry the kernels are not built for.
 //
-// Exit 0 pass, 1 fail, 77 skip (no CUDA device).
+// Exit 0 pass, 1 fail, 77 skip (no CUDA device, or <fixture dir>/SKIP: the fixture script found no numpy / gguf-py).
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layout.hpp"
@@ -334,6 +334,12 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) chunk_override = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--no-force") == 0) force = false;
+    }
+    if (std::ifstream skip(dir + "/SKIP"); skip) {
+        std::string why;
+        std::getline(skip, why);
+        std::printf("prefill_qwen36_test: the fixtures were not generated (%s/SKIP: %s): skip\n", dir.c_str(), why.c_str());
+        return 77;
     }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
