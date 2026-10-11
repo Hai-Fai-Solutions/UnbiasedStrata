@@ -2097,20 +2097,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
-        // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
-        // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
-            const auto& f = lay.fmt[(size_t) l];
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                     "engine has no GPU kernels for\n", (long long) l,
-                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
-                             f.gu_type, f.d_type);
-                return 1;
-            }
-        }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // --vram-cap: the blocker, allocated before anything else of this engine is, so every later figure (and the
@@ -2237,8 +2223,46 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", plan.refusal.c_str());
             return 2;
         }
+        // the expert formats the GPU kernels do not have (the format whitelist below, which the start would refuse
+        // on first): named per layer here as step 3's work, so the gate's output is the whole list
+        {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::map<std::string, std::vector<int64_t>> missing;
+            for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+                const auto& f = lay.fmt[(size_t) l];
+                if (strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) continue;
+                missing[std::string(strata::ggml_type_name((uint32_t) f.gu_type)) + "/" +
+                        strata::ggml_type_name((uint32_t) f.d_type)].push_back(l);
+            }
+            for (const auto& m : missing) {
+                std::string ls;
+                for (size_t i = 0; i < m.second.size(); ++i) {
+                    if (i == 8 && m.second.size() > 10) { ls += ", ... (" + std::to_string(m.second.size()) + " layers)"; break; }
+                    ls += (i ? ", " : "") + std::to_string(m.second[i]);
+                }
+                std::fprintf(stderr, "strata generate: step 3 also needs GPU expert kernels for gate-up/down %s (%zu layers: %s)\n",
+                             m.first.c_str(), m.second.size(), ls.c_str());
+            }
+        }
         std::fprintf(stderr, "strata generate: %s\n", strata::core::qwen35moe_not_yet(g).c_str());
         return 2;
+    }
+    {
+        // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
+        // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
+        // an unsupported dequant type left the prompt path's fp16 buffer unwritten.  (After the Qwen3.6 gate, which
+        // prints the plan and names these formats itself: step 2's gate is what a Qwen3.6 file reaches.)
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+                std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
+                                     "engine has no GPU kernels for\n", (long long) l,
+                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
+                             f.gu_type, f.d_type);
+                return 1;
+            }
+        }
     }
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
