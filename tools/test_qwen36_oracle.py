@@ -281,6 +281,25 @@ class GdnTests(unittest.TestCase):
                 self.assertGreater(rel_l1(got, ref), 0.05, f"{seam} cannot tell {key}={rival} from the faithful reading")
                 self.assertGreater(rel_l1(other, base), 5e-3, "and it must reach the logits")
 
+    def test_gqa_mapping_needs_more_than_one_kv_head(self):
+        m = fresh("gqa", n_head=4, n_head_kv=2, seed=11)
+        self.assertEqual((m.hp.n_head, m.hp.n_head_kv), (4, 2))
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            base, _, _ = run(m, dump_dir=d)
+            ref = read_dump(d)["kqv-3"][2]
+        m.opts["gqa_map"] = "interleaved"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            other, _, _ = run(m, dump_dir=d)
+            got = read_dump(d)["kqv-3"][2]
+        self.assertGreater(rel_l1(got, ref), 0.05)
+        self.assertGreater(rel_l1(other, base), 5e-3)
+        # with one KV head every mapping is the same: the default fixtures cannot see this rival
+        m1 = fresh("gqa1")
+        a, _, _ = run(m1)
+        m1.opts["gqa_map"] = "interleaved"
+        b, _, _ = run(m1)
+        np.testing.assert_array_equal(a, b)
+
     def test_l2_norm_puts_eps_inside_the_sum(self):
         # build_gdn_l2_norm (models.h:14): x / sqrt(sum(x^2) + eps), NOT x / max(sqrt(sum), eps)
         rng = np.random.default_rng(0)
@@ -338,6 +357,28 @@ class AttentionTests(unittest.TestCase):
         np.testing.assert_allclose(y2[:, :, 2], x[:, :, 2], atol=1e-6)
         np.testing.assert_allclose(y2[:, :, 2 + n_rot // 2], x[:, :, 2 + n_rot // 2], atol=1e-6)
         self.assertGreater(np.abs(y2[1:, :, 0] - x[1:, :, 0]).max(), 1e-3)
+
+
+class ActivationQuantTests(unittest.TestCase):
+    def test_q8_k_and_q8_0_rounding(self):
+        rng = np.random.default_rng(3)
+        x = (rng.standard_normal((4, 512)) * 2).astype(F32)
+        for wt, bs in (("Q6_K", 256), ("IQ2_S", 256), ("Q8_0", 32)):
+            y = q.quantize_act(x, wt)
+            amax = np.abs(x.reshape(-1, bs)).max(axis=1)
+            err = np.abs((x - y).reshape(-1, bs)).max(axis=1)
+            self.assertTrue((err <= amax / 127 * 0.5 * 1.01 + 1e-7).all(), wt)     # half a step of the block's scale
+            self.assertGreater(err.max(), 0)                                       # and it is not the identity
+            np.testing.assert_allclose(q.quantize_act(y, wt), y, rtol=1e-5, atol=1e-6)   # idempotent
+            # at most 255 distinct levels per block
+            self.assertLessEqual(len(np.unique(y.reshape(-1, bs)[0])), 255)
+        np.testing.assert_array_equal(q.quantize_act(x, "F32"), x)                 # F32 weights (router, ssm_alpha/beta): untouched
+
+    def test_q8_mode_changes_little_on_the_f32_fixture(self):
+        m = fresh("q8m")
+        base, _, _ = run(m)
+        m.opts["act_quant"] = "q8"                                                  # fixture weights are F32: no effect at all
+        np.testing.assert_array_equal(run(m)[0], base)
 
 
 class DumpFormatTests(unittest.TestCase):

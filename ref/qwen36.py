@@ -182,6 +182,40 @@ def mm(x, w):
     return (x.astype(F32) @ w.astype(F32).T).astype(F32)
 
 
+_K_FAMILY = ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS")
+_Q8_0_FAMILY = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL")
+
+
+def quantize_act(x: np.ndarray, weight_type: str) -> np.ndarray:
+    """What ggml's quantized matmul sees of an F32 activation: rows rounded to the weight type's vec_dot_type, then
+    dequantized (the integer dot product equals the float dot of these values, up to summation order).
+    K-quant and IQ weights use Q8_K (blocks of 256, float scale from the signed max, quantize_row_q8_K_ref);
+    Q4_0/Q5_0/Q8_0/IQ4_NL use Q8_0 (blocks of 32, fp16 scale, quantize_row_q8_0_ref).  F32/F16/BF16 weights: unchanged."""
+    if weight_type in _K_FAMILY:
+        bs = 256
+    elif weight_type in _Q8_0_FAMILY:
+        bs = 32
+    else:
+        return x
+    shp = x.shape
+    b = x.reshape(-1, bs).astype(F32)
+    if bs == 256:
+        i = np.abs(b).argmax(axis=1)
+        mx = b[np.arange(len(b)), i]                              # signed value of largest magnitude
+        with np.errstate(divide="ignore", invalid="ignore"):
+            iscale = np.where(mx != 0, F32(-127.0) / mx, F32(0)).astype(F32)
+        q = np.minimum(127, np.rint(iscale[:, None] * b))         # nearest_int: round half to even
+        d = np.where(iscale != 0, F32(1.0) / iscale, F32(0)).astype(F32)
+        return (q * d[:, None]).astype(F32).reshape(shp)
+    amax = np.abs(b).max(axis=1)
+    d = (amax / F32(127.0)).astype(F32)
+    d16 = d.astype(np.float16).astype(F32)                        # block_q8_0 stores the scale as fp16
+    with np.errstate(divide="ignore", invalid="ignore"):
+        idv = np.where(d != 0, F32(1.0) / d, F32(0)).astype(F32)
+    q = np.sign(b * idv[:, None]) * np.floor(np.abs(b * idv[:, None]) + F32(0.5))   # roundf: half away from zero
+    return (q * d16[:, None]).astype(F32).reshape(shp)
+
+
 def rope_multi(x: np.ndarray, pos4: np.ndarray, n_rot: int, sections: tuple, base: float, pairs: str = "neox") -> np.ndarray:
     """ggml_rope_multi in GGML_ROPE_TYPE_IMROPE mode (ggml-cpu/ops.cpp:5991-6059, 6143-6233), ext_factor 0, freq_scale 1.
 
@@ -280,9 +314,23 @@ class Model:
             attn_gate=True,           # rival False: skip the sigmoid output gate of the full-attention layer
             router_norm=None,         # None: llama.cpp's norm_w = true; rival False: raw softmax weights
             rope_pairs="neox",        # rival "adjacent"
+            act_quant="none",         # "q8": quantize activations as ggml does before each quantized matmul (a noise model, not a rival)
+            force_inputs=None,        # directory of a llama.cpp dump: every layer starts from ITS l_out-(il-1), so each layer's error is local
+            force_topk=None,          # {layer: (T, K) int array}: use these experts instead of the router's own top-k
+            gqa_map="grouped",        # rival "interleaved": query head h reads kv head h % n_head_kv instead of h // (n_head/n_head_kv)
         )
 
     # ---- tensor access (small tensors cached; experts always lazy per expert)
+    def qtype(self, name):
+        return self.g.info(name).type_name
+
+    def mm(self, x, wname):
+        """y = x @ W.T for the named weight; with opts["act_quant"] == "q8" the activation first goes through the
+        rounding ggml's quantized matmul applies (see quantize_act)."""
+        if self.opts["act_quant"] == "q8":
+            x = quantize_act(x, self.qtype(wname))
+        return mm(x, self.t(wname))
+
     def has(self, name):
         return name in self.names
 
@@ -331,12 +379,12 @@ class Model:
         dump("conv_states", il, st.conv.reshape(1, -1))                # ne [(K-1)*C, 1]: ggml's [K-1, C] flattened
         dump("conv_states_reshaped", il, st.conv)                      # ne [K-1, C]
 
-        qkv = dump("linear_attn_qkv_mixed", il, mm(x, self.t(f"{p}.attn_qkv.weight")))        # (T, conv_dim)
+        qkv = dump("linear_attn_qkv_mixed", il, self.mm(x, f"{p}.attn_qkv.weight"))        # (T, conv_dim)
         dump("qkv_mixed_transposed", il, qkv.T)
-        z = dump("z", il, mm(x, self.t(f"{p}.attn_gate.weight")))                              # (T, value_dim)
-        beta_raw = dump("beta", il, mm(x, self.t(f"{p}.ssm_beta.weight"))[:, :, None])         # ne [1, Hv, T]
+        z = dump("z", il, self.mm(x, f"{p}.attn_gate.weight"))                              # (T, value_dim)
+        beta_raw = dump("beta", il, self.mm(x, f"{p}.ssm_beta.weight")[:, :, None])         # ne [1, Hv, T]
         beta = dump("beta_sigmoid", il, sigmoid(beta_raw))[:, :, 0]
-        alpha = dump("alpha", il, mm(x, self.t(f"{p}.ssm_alpha.weight")))                      # (T, Hv)
+        alpha = dump("alpha", il, self.mm(x, f"{p}.ssm_alpha.weight"))                      # (T, Hv)
         sp = dump("a_softplus", il, softplus(alpha + self.t(f"{p}.ssm_dt.bias")))
         gate = dump("gate", il, (sp * self.t(f"{p}.ssm_a")).astype(F32))                        # (T, Hv), < 0
 
@@ -388,7 +436,7 @@ class Model:
         gated = (normed * act(z.reshape(T, Hv, S))).astype(F32)
         fo = dump("final_output", il, gated.reshape(T, hp.value_dim))
         st.conv = new_conv
-        return dump("linear_attn_out", il, mm(fo, self.t(f"{p}.ssm_out.weight")))
+        return dump("linear_attn_out", il, self.mm(fo, f"{p}.ssm_out.weight"))
 
     def attention(self, x, il, st: LayerState, pos, dump, mtp=False):
         """build_layer_attn (qwen35moe.cpp:278-357): joint Q+gate projection, Q/K RMS norm, IMRoPE on 25%, causal
@@ -404,13 +452,13 @@ class Model:
             return dump(mtp_name if mtp else trunk, il, arr)
 
         if self.has(f"{p}.attn_qkv.weight"):                          # build_qkv fused path (llama-graph.cpp:1649-1686)
-            qkv = emit("wqkv", None, mm(x, self.t(f"{p}.attn_qkv.weight")))
+            qkv = emit("wqkv", None, self.mm(x, f"{p}.attn_qkv.weight"))
             nq, nk = hd * 2 * nh, hd * nkv
             qfull, kc, vc = qkv[:, :nq], qkv[:, nq:nq + nk], qkv[:, nq + nk:nq + 2 * nk]
         else:
-            qfull = mm(x, self.t(f"{p}.attn_q.weight"))
-            kc = mm(x, self.t(f"{p}.attn_k.weight"))
-            vc = mm(x, self.t(f"{p}.attn_v.weight"))
+            qfull = self.mm(x, f"{p}.attn_q.weight")
+            kc = self.mm(x, f"{p}.attn_k.weight")
+            vc = self.mm(x, f"{p}.attn_v.weight")
         qfull = emit("Qcur_full", "mtp_Qcur_full", qfull)
         kc = emit("Kcur", None, kc)
         vc = emit("Vcur", None, vc)
@@ -434,14 +482,15 @@ class Model:
         st.k = np.concatenate([st.k, k]); st.v = np.concatenate([st.v, v])
         n_kv = st.k.shape[0]
         grp = nh // nkv
+        kvmap = np.arange(nh) // grp if self.opts["gqa_map"] == "grouped" else np.arange(nh) % nkv
         scale = F32(1.0 / np.sqrt(F32(hd)))                           # hparams.f_attention_scale == 0 -> 1/sqrt(head_dim)
         # kq[h, t, j] = k_j . q_t  (ggml: ne [n_kv, T, n_head]); causal mask j <= n_past + t
-        kq = np.einsum("tnd,jnd->ntj", q, st.k[:, np.arange(nh) // grp]).astype(F32)
+        kq = np.einsum("tnd,jnd->ntj", q, st.k[:, kvmap]).astype(F32)
         dump("kq", il, kq)
         mask = np.arange(n_kv)[None, :] > (n_past + np.arange(T))[:, None]
         sc = np.where(mask[None], F32(-np.inf), kq * scale)
         pr = dump("kq_soft_max", il, softmax(sc))
-        kqv = dump("kqv", il, np.einsum("ntj,jnd->ntd", pr, st.v[:, np.arange(nh) // grp]).astype(F32))
+        kqv = dump("kqv", il, np.einsum("ntj,jnd->ntd", pr, st.v[:, kvmap]).astype(F32))
         pre = emit("attn_pregate", "mtp_attn_pregate", kqv.transpose(1, 0, 2).reshape(T, nh * hd))
         if not mtp:
             gate = dump("gate_reshaped", il, gate)
@@ -449,7 +498,7 @@ class Model:
         else:
             gs = sigmoid(gate)
         gated = emit("attn_gated", None, (pre * gs).astype(F32) if self.opts["attn_gate"] else pre)
-        return emit("attn_output", "mtp_attn_out", mm(gated, self.t(f"{p}.attn_output.weight")))
+        return emit("attn_output", "mtp_attn_out", self.mm(gated, f"{p}.attn_output.weight"))
 
     def moe(self, x, il, dump, mtp=False):
         """build_layer_ffn (qwen35moe.cpp:494-548) with build_moe_ffn (llama-graph.cpp:1993-2355): softmax router,
@@ -457,11 +506,12 @@ class Model:
         hp = self.hp
         p = f"blk.{il}"
         T, E, K = x.shape[0], hp.n_expert, hp.n_expert_used
-        logits = dump("ffn_moe_logits", il, mm(x, self.t(f"{p}.ffn_gate_inp.weight")))        # (T, E)
+        logits = dump("ffn_moe_logits", il, self.mm(x, f"{p}.ffn_gate_inp.weight"))        # (T, E)
         probs = dump("ffn_moe_probs", il, softmax(logits))                                     # SOFTMAX gating
         order = np.argsort(-probs, axis=1, kind="stable")                                     # argsort descending
         dump("ffn_moe_argsort", il, order, "i32")
-        topk = dump("ffn_moe_topk", il, order[:, :K], "i32")                                   # (T, K)
+        sel = order[:, :K] if self.opts["force_topk"] is None else self.opts["force_topk"][il]
+        topk = dump("ffn_moe_topk", il, sel, "i32")                                   # (T, K)
         w = dump("ffn_moe_weights", il, np.take_along_axis(probs, topk, 1)[:, :, None])        # ne [1, K, T]
         w2 = w[:, :, 0]
         ssum = dump("ffn_moe_weights_sum", il, w2.sum(axis=1, keepdims=True, dtype=F32))        # ne [1, T]
@@ -470,12 +520,15 @@ class Model:
         wn = dump("ffn_moe_weights_norm", il, (w2 / sc).astype(F32)) if do_norm else w2
         if hp.expert_weights_scale not in (0.0, 1.0):
             wn = dump("ffn_moe_weights_scaled", il, (wn * F32(hp.expert_weights_scale)).astype(F32))
+        q8 = self.opts["act_quant"] == "q8"
+        gu_name = f"{p}.ffn_gate_up_exps.weight" if self.has(f"{p}.ffn_gate_up_exps.weight") else f"{p}.ffn_gate_exps.weight"
         gate_all = np.empty((T, K, hp.n_ff_exp), F32)
         up_all = np.empty_like(gate_all)
         for t in range(T):
             for j in range(K):
                 g_, u_, _ = self.expert_ffn_weights(il, int(topk[t, j]))
-                gate_all[t, j], up_all[t, j] = x[t] @ g_.T, x[t] @ u_.T
+                xt = quantize_act(x[t], self.qtype(gu_name)) if q8 else x[t]
+                gate_all[t, j], up_all[t, j] = xt @ g_.T, xt @ u_.T
         if self.has(f"{p}.ffn_gate_up_exps.weight"):
             dump("ffn_moe_gate_up", il, np.concatenate([gate_all, up_all], axis=2))      # ne [2*ff, K, T]: gate then up
         dump("ffn_moe_gate", il, gate_all)
@@ -485,7 +538,8 @@ class Model:
         for t in range(T):
             for j in range(K):
                 _, _, d_ = self.expert_ffn_weights(il, int(topk[t, j]))
-                down[t, j] = act[t, j] @ d_.T
+                at = quantize_act(act[t, j], self.qtype(f"{p}.ffn_down_exps.weight")) if q8 else act[t, j]
+                down[t, j] = at @ d_.T
         dump("ffn_moe_down", il, down)
         weighted = dump("ffn_moe_weighted", il, (down * wn[:, :, None]).astype(F32))
         moe_out = weighted[:, 0]
@@ -495,11 +549,11 @@ class Model:
         nm = (lambda trunk, m: (m or trunk) if mtp else trunk)
         moe_out = dump(nm("ffn_moe_out", "mtp_ffn_moe_out"), il, moe_out)
         # shared expert, build_ffn(LLM_FFN_SILU, LLM_FFN_PAR) then a per-token sigmoid gate (qwen35moe.cpp:516-545)
-        up = dump("ffn_up", il, mm(x, self.t(f"{p}.ffn_up_shexp.weight")))
-        gt = dump("ffn_gate", il, mm(x, self.t(f"{p}.ffn_gate_shexp.weight")))
+        up = dump("ffn_up", il, self.mm(x, f"{p}.ffn_up_shexp.weight"))
+        gt = dump("ffn_gate", il, self.mm(x, f"{p}.ffn_gate_shexp.weight"))
         sw = dump("ffn_swiglu", il, (silu(gt) * up).astype(F32))
-        sh = dump(nm("ffn_shexp", "mtp_ffn_shexp"), il, mm(sw, self.t(f"{p}.ffn_down_shexp.weight")))
-        sg = mm(x, self.t(f"{p}.ffn_gate_inp_shexp.weight")[None, :])                            # (T, 1)
+        sh = dump(nm("ffn_shexp", "mtp_ffn_shexp"), il, self.mm(sw, f"{p}.ffn_down_shexp.weight"))
+        sg = mm(x, self.t(f"{p}.ffn_gate_inp_shexp.weight")[None, :])   # F32 weight: never activation-quantized                            # (T, 1)
         if not mtp:
             dump("shared_expert_gate", il, sg)
         sgs = dump(nm("shared_expert_gate_sigmoid", "mtp_shared_expert_gate_sigmoid"), il, sigmoid(sg))
@@ -519,6 +573,8 @@ class Model:
         x = dump("model.input_embed", -1, self.embed(ids))
         for il in range(hp.n_layer):
             ls = st.layers.setdefault(il, LayerState())
+            if self.opts["force_inputs"] and il > 0:
+                x = np.fromfile(f"{self.opts['force_inputs']}/l_out-{il - 1}.f32", dtype=F32).reshape(T, -1)
             inp = x
             an = (dump("norm", il, rms_norm(x, hp.eps)) * self.t(f"blk.{il}.attn_norm.weight")).astype(F32)
             an = dump("attn_norm", il, an)
@@ -533,9 +589,9 @@ class Model:
         h = dump("h_nextn", -1, (h * self.t("output_norm.weight")).astype(F32))
         out_name = "output.weight" if self.has("output.weight") else "token_embd.weight"   # tied head (qwen35moe.cpp:47-52)
         last = dump("result_norm", -1, h[-1:])
-        logits = dump("result_output", -1, mm(last, self.t(out_name)))
+        logits = dump("result_output", -1, self.mm(last, out_name))
         if all_logits:
-            dump("result_output_all", -1, mm(h, self.t(out_name)))
+            dump("result_output_all", -1, self.mm(h, out_name))
         return logits[0], h, st
 
     # ---- the nextn (MTP) block, graph_mtp (qwen35moe.cpp:550-741)
@@ -561,7 +617,7 @@ class Model:
         en = dump("mtp_enorm", il, (dump("norm", il, rms_norm(tok, hp.eps)) * self.t(f"{p}.nextn.enorm.weight")).astype(F32))
         hn = dump("mtp_hnorm", il, (dump("norm", il, rms_norm(h, hp.eps)) * self.t(f"{p}.nextn.hnorm.weight")).astype(F32))
         cat = dump("mtp_concat", il, np.concatenate([en, hn], axis=1))        # ggml_concat(e_norm, h_norm, dim 0)
-        cur = dump("mtp_eh_proj", il, mm(cat, self.t(f"{p}.nextn.eh_proj.weight")))
+        cur = dump("mtp_eh_proj", il, self.mm(cat, f"{p}.nextn.eh_proj.weight"))
         an = dump("mtp_attn_norm", il, (dump("norm", il, rms_norm(cur, hp.eps)) * self.t(f"{p}.attn_norm.weight")).astype(F32))
         att = self.attention(an, il, ls, pos, dump, mtp=True)
         res = dump("mtp_attn_residual", il, (att + cur).astype(F32))
@@ -573,7 +629,7 @@ class Model:
         dump("mtp_shared_head_norm", -1, hh)
         head = f"{p}.nextn.shared_head_head.weight" if self.has(f"{p}.nextn.shared_head_head.weight") else (
             "output.weight" if self.has("output.weight") else "token_embd.weight")
-        logits = dump("result_output", -1, mm(hh, self.t(head)))
+        logits = dump("result_output", -1, self.mm(hh, head))
         st.n_past += T
         return logits, st
 
@@ -587,6 +643,9 @@ def main() -> int:
     ap.add_argument("--split", type=int, default=0, help="feed the tokens CHUNK at a time, carrying GDN and KV state; dump only the last chunk")
     ap.add_argument("--opt", action="append", default=[], metavar="KEY=VALUE",
                     help="flip one reading to its rival (see Model.opts), e.g. gdn_gate=sigmoid; for negative controls")
+    ap.add_argument("--act-quant", choices=["none", "q8"], default="none", help="q8: round activations to Q8_K / Q8_0 before quantized matmuls, as ggml does")
+    ap.add_argument("--force-topk", metavar="DIR", help="use the expert choices in DIR/ffn_moe_topk-<layer>.f32 (e.g. a llama.cpp dump) instead of the router's own")
+    ap.add_argument("--force-inputs", metavar="DIR", help="start every layer from DIR/l_out-<il-1>.f32 (a llama.cpp dump of the same tokens): measures per-layer, not accumulated, error")
     ap.add_argument("--mtp", action="store_true", help="also run the nextn block on (tokens[1:], trunk hidden[:-1])")
     a = ap.parse_args()
     toks = [int(t) for t in a.tokens.split(",")] if a.tokens else [ord(c) for c in a.text]
@@ -595,6 +654,11 @@ def main() -> int:
         k, v = kv.split("=", 1)
         assert k in m.opts, f"unknown option {k!r}; known: {sorted(m.opts)}"
         m.opts[k] = {"True": True, "False": False, "None": None}.get(v, v)
+    m.opts["act_quant"] = a.act_quant
+    m.opts["force_inputs"] = a.force_inputs
+    if a.force_topk:
+        m.opts["force_topk"] = {il: np.fromfile(f"{a.force_topk}/ffn_moe_topk-{il}.f32", dtype=F32).astype(np.int64).reshape(len(toks), -1)
+                                for il in range(m.hp.n_layer)}
     d = Dump(a.dump)
     if a.split:
         st = None

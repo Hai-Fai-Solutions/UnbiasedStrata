@@ -289,6 +289,7 @@ def main() -> int:
     ap.add_argument("out")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--like-real", metavar="REAL.gguf", help="take rope/eps/interval/ratios and the tensor-name set from a real qwen35moe GGUF")
+    ap.add_argument("--heads", metavar="N,KV", help="attention heads and KV heads (default 2,1; use 4,2 to make GQA non-degenerate)")
     ap.add_argument("--no-nextn", action="store_true", help="omit the MTP block (the real UD-IQ3_XXS file has none)")
     ap.add_argument("--fused-gate-up", action="store_true", help="ffn_gate_up_exps instead of ffn_gate_exps + ffn_up_exps")
     ap.add_argument("--fused-qkv", action="store_true", help="attention layers carry attn_qkv instead of attn_q/k/v")
@@ -300,6 +301,8 @@ def main() -> int:
     else:
         c = Cfg()
     c.seed = a.seed
+    if a.heads:
+        c.n_head, c.n_head_kv = (int(x) for x in a.heads.split(","))
     if a.no_nextn:
         c.nextn = False
     c.fused_gate_up |= a.fused_gate_up

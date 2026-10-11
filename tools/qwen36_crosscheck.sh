@@ -12,7 +12,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 W="$(mkdir -p "${1:?usage: $0 WORKDIR [REAL.gguf]}" && cd "$1" && pwd)"
 REAL="${2:-}"
-LL="$REPO/third_party/llama.cpp"
+LL="${LLAMA_CPP_DIR:-$REPO/third_party/llama.cpp}"
 B="$W/llbuild"
 PY="${PYTHON:-python3}"
 
@@ -30,6 +30,7 @@ $PY "$SYN" base.gguf > /dev/null
 $PY "$SYN" seed7.gguf --seed 7 > /dev/null
 $PY "$SYN" fused_gate_up.gguf --fused-gate-up --seed 3 > /dev/null
 $PY "$SYN" fused_qkv.gguf --fused-qkv --no-nextn --seed 4 > /dev/null
+$PY "$SYN" gqa.gguf --heads 4,2 --seed 11 > /dev/null          # n_head_kv > 1: the h // (n_head/n_head_kv) mapping is exercised
 $PY "$SYN" stray_scale.gguf --expert-weights-scale 2.5 --seed 5 > /dev/null
 [ -n "$REAL" ] && $PY "$SYN" like_real.gguf --like-real "$REAL" | head -4
 
@@ -65,6 +66,7 @@ run_case base_c7   base.gguf $T40 7 0          # chunks of 7, the last call (5 t
 run_case seed7     seed7.gguf $T11 0 1
 run_case fused_gu  fused_gate_up.gguf $T11 0 1
 run_case fused_qkv fused_qkv.gguf $T11 0 0
+run_case gqa4_2    gqa.gguf $T40 0 1
 run_case stray_scl stray_scale.gguf $T11 0 1
 [ -n "$REAL" ] && run_case like_real like_real.gguf $T40 0 1
 
