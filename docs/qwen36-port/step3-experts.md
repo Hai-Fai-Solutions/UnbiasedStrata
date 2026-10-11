@@ -40,10 +40,12 @@ Q8_0 AVX-2 kernels, Q5_K and Q6_K rows go to ggml's), `generate.cpp`.
 blob (the dequantization `oracle-crosscheck.md` cross-checked bit for bit against `ref/load.py` on the real file)
 times a double-precision SwiGLU expert on 3 random tokens; (b) the CPU path (ggml-cpu `vec_dot`, Q8_K activations);
 (c) the GPU path (`native_expert_grouped`, q8_1 activations), once per kernel family (decode-once vs per-entry, bitwise);
-(d) the GPU dequantizers against `to_float`; (e) the negative control. Tolerance for (b) and (c) against (a): the
-file's existing 3e-2 relative L1, which is the Q8-activation bound (`oracle-crosscheck.md` "Tolerance policy": the
-Q8 oracle's `ffn_moe_out` median 2.3e-3, max 5.3e-3, with the 4x margin 2e-2; the test's 3e-2 predates it and is kept
-as the file's bound). Measured values are an order below it (section 4).
+(d) the GPU dequantizers against `to_float`; (e) the negative control. Tolerances (relative L1): GPU against (a)
+2e-2, the Q8-activation bound of `oracle-crosscheck.md` "Tolerance policy" (the Q8 oracle's `ffn_moe_out` max 5.3e-3
+with the 4x margin), 3e-2 only for a pair with a Q5_0 role (32-value blocks without a min: q4_K/q5_0 measures 2.7e-2
+at 2560 x 640, the pre-existing pair the CMake note describes); CPU against (a) 3e-2 (ggml-cpu rounds the activations
+to Q8_K, one scale per 256 values, against the GPU's q8_1 per 32: measured up to 2.2e-2); CPU against GPU 4e-2 (both
+roundings, measured up to 2.4e-2). Qwen3.6's five pairs measure 9.7e-3 to 1.3e-2 on the GPU (section 4).
 
 The negative control (e), per the brief and `upstream-tooling.md` section 3: the high byte of one block's fp16 scale
 (its sign) flipped in down row 5 must move that row's GPU output by more than the gate and no other row by any bit

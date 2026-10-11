@@ -423,10 +423,16 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
-    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
-                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
-                ok ? "ok" : "FAIL");
+    // GPU vs the float reference: the tolerance policy's bound for a Q8-activation path (oracle-crosscheck.md: the Q8
+    // oracle's ffn_moe_out max 5.3e-3 x 4), measured 9.7e-3 to 1.3e-2 on Qwen3.6's five pairs; 3e-2 for a pair with a
+    // Q5_0 role (32-value blocks with no min on a 640-wide row: q4_K/q5_0 measured 2.7e-2; see the CMake note).  CPU
+    // vs the reference: ggml-cpu rounds the activations to Q8_K (256-value blocks, one scale per 256 values, against
+    // the GPU's q8_1 per 32), measured up to 2.2e-2, so 3e-2.  CPU vs GPU: both roundings, measured up to 2.4e-2, 4e-2.
+    const double gpu_bound = (f.gu_type == 6 || f.d_type == 6) ? 3e-2 : 2e-2;
+    const bool ok = ec < 3e-2 && eg < gpu_bound && ecg < 4e-2 && std::isfinite(ec) && std::isfinite(eg) && std::isfinite(ecg);
+    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e (< 3e-2)  gpu rel %.2e (< %.0e)  cpu-gpu %.2e (< 4e-2)  %s\n",
+                label.c_str(), ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec,
+                eg, gpu_bound, ecg, ok ? "ok" : "FAIL");
     return failures + (ok ? 0 : 1);
 }
 
