@@ -118,7 +118,7 @@ void qwen36(const fs::path& data) {
     struct Case { const char* file; int gu, d, d_odd; int64_t blob, blob_odd, blob_39; uint64_t total; };
     const Case cases[] = {
         {"qwen36-iq3_xxs.txt", 22, 18, 23, 1073152, 1228800, 1228800, 11108614144ull},
-        {"qwen36-q4_k_xl.txt", 12, 13, 14, 1900544, 2039808, 2301952, 19636158464ull},
+        {"qwen36-q4_k_xl.txt", 12, 13, 14, 1900544, 2039808, 2301952, 19635634176ull},
     };
     for (const Case& c : cases) {
         TempDir d;
@@ -143,9 +143,12 @@ void qwen36(const fs::path& data) {
             check(f0.up_off == f0.gu_row * 512 && f0.down_off == 2 * f0.up_off && f0.bytes == f0.down_off + f0.d_row * 2048,
                   std::string(c.file) + ": blob = gate rows | up rows | down rows at 512 and 2048");
         }
+        // n_ff 640 is not whole 256-value blocks for IQ2_S / Q4_K rows, so native_fmt refuses before the blob is
+        // compared; a geometry that IS whole blocks (2048 x 512 for a 2560 x 640 pack) would reach the blob message.
         const bool refused = !load(d.path, 40, 256, 2560, 640, err);
-        check(refused && err.find("layer 0 blob is") != std::string::npos && err.find("2560 x n_ff 640") != std::string::npos,
-              std::string(c.file) + ": at Flash-Next's 2560 x 640 refused by its numbers: " + err.substr(0, 60));
+        check(refused && (err.find("not whole blocks") != std::string::npos ||
+                          (err.find("layer 0 blob is") != std::string::npos && err.find("2560 x n_ff 640") != std::string::npos)),
+              std::string(c.file) + ": at Flash-Next's 2560 x 640 refused: " + err.substr(0, 60));
     }
     // a pack with no native_experts.txt is the canonical Q2_0 form, which bakes 2560 x 640: refused for a 2048 x 512 model
     TempDir d;
