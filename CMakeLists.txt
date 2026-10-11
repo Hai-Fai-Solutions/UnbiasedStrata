@@ -269,6 +269,12 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
+if(STRATA_BUILD_TESTS)
+  # Qwen3.6 port, step 2: the VRAM planner's arithmetic (strata/plan/vram_plan.hpp) against the study's table 4.3
+  add_executable(vram_plan_test tests/core/vram_plan_test.cpp)
+  target_link_libraries(vram_plan_test PRIVATE strata_plan)
+  add_test(NAME vram_plan_test COMMAND vram_plan_test)
+endif()
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
