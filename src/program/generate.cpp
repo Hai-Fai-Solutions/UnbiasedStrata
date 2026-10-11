@@ -3263,9 +3263,12 @@ int main(int argc, char** argv) {
             o.mtp.clear();
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
-        // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
-        static const strata::core::ModelGeometry draft_geometry{};
+        // Flash-Next: the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
+        // so it always sees the canonical geometry.  Qwen3.6 (qwen35moe): the drafter is the -MTP file's nextn block
+        // and its geometry FOLLOWS THE TARGET (docs/QWEN36-35B-A3B.md 3.10; the pack records what it was cut for and
+        // MtpDrafter::load refuses a mismatch by name).  `static` because MtpDrafter keeps a reference.
+        static const strata::core::ModelGeometry draft_geometry =
+            g.arch == strata::core::ModelArch::Qwen35Moe ? g : strata::core::ModelGeometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
