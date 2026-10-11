@@ -150,21 +150,29 @@ RMS against an FP32 reference over random weights; the oracle's own real-file nu
 
 ### 3.2 VM 211, GTX 1080 Ti (sm_61), 2026-10-11
 
-Not run: the card's lock was held for the whole 30-minute wait the rules allow (by `qwen36-step3-gdn`, then
-`qwen36-step3-attn`, then `qwen36-step3-experts`, with a `llama-server` alive the whole time).  Everything is staged
-for it: the tree at `/home/rk/qwen36-step3-prefill/`, the fixtures and the oracle's dumps at
-`/home/rk/qwen36-step3-prefill-fx/` (copied from VM 221, not regenerated), and `/home/rk/run211-prefill.sh`, which
-configures at sm_61 with `STRATA_EXPERIMENTAL_SM60=ON`, builds the five test targets, runs `gdn_rec_parity`,
-`gemm_bf16_parity`, the two fused tests (expected exit 77), `prefill_qwen36_test` on `gdn3` and `full4` (with
-`STRATA_PREFILL_TIMING=1`, so the log says whether the prompt MoE took MMQ or the FP16 path) and `gdn3` again under
-`STRATA_PREFILL_MMQ=0`, logs to `/home/rk/logs/qwen36-step3-prefill-211.log`, and removes the lock.  To run it once
-the lock is free:
+Under the card's lock (taken 13:08 after the experts agent released it; held 182 s): `/home/rk/run211-prefill.sh`,
+the tree at `/home/rk/qwen36-step3-prefill/` (configure as the common file says at sm_61 with
+`STRATA_EXPERIMENTAL_SM60=ON`, the five test targets built in 168 s), the fixtures and dumps copied from VM 221 to
+`/home/rk/qwen36-step3-prefill-fx/`; the log is `/home/rk/logs/qwen36-step3-prefill-211.log`.
 
-    ssh rk@192.168.50.43 'set -o noclobber; [ -z "$(pgrep -x llama-server)" ] && [ -z "$(pgrep -f sweep_ladder_1080ti.py)" ] \
-        && echo qwen36-step3-prefill > /home/rk/VM-BUSY && (nohup /home/rk/run211-prefill.sh > /dev/null 2>&1 &)'
-    # then: until ssh rk@192.168.50.43 test -f /home/rk/logs/qwen36-step3-prefill-211.DONE; do sleep 30; done
-
-The numbers go here when it has run.
+- `gdn_rec_parity`: 0 failures; the same bits for both variants at both geometries; engine vs reference y16
+  1.76e-4 to 1.79e-4, state 4e-8 to 1.0e-7; the rivals 0.86 to 1.33 away; `gdn_conv` 5.2e-8 to 5.4e-8; the three
+  geometry refusals. The numbers equal the 4090's to the printed digits.
+- `gemm_bf16_parity`: 0 failures (Pascal's fp32 widening path).
+- `prefill_fused_iq_test`, `prefill_fused_moe_test`: exit 77 ("the fused kernels need sm_80 or newer"), as expected.
+- `prefill_qwen36_test gdn3` and `full4`: pass, both chunkings.  Against the F32 oracle with forced inputs:
+  `attn_norm` 2.2e-8 to 3.1e-8, `linear_attn_out` 8.3e-4 to 8.6e-4, `attn_output-3` 5.9e-4, `attn_post_norm`
+  8.2e-5 to 4.4e-4, `ffn_out` 7.9e-3 to 1.05e-2, `l_out` 2.1e-3 to 3.7e-3; the router 5 (gdn3) / 7 (full4)
+  near-tie swaps, none elsewhere; negatives 0.922 / 0.690 / 0.057 / 0.541; accumulated `l_out` 3.7e-3 to 9.1e-3.
+  The same as the 4090 to two digits: the prompt MoE took the same path on both cards.
+- Which prompt-MoE path runs on Pascal: MMQ.  `STRATA_PREFILL_TIMING=1` shows the MMQ phases (gather, dequant =
+  the gather marks, gemm gate/up 1 ms); and `STRATA_PREFILL_MMQ=0` (the FP16 GEMM over dequantized weights) gives
+  different numbers (accumulated `l_out` 1.4e-3 / 3.0e-3 / 4.1e-3 instead of 3.7e-3 / 6.0e-3 / 8.2e-3; against the
+  Q8 oracle `ffn_out-0` 2.25e-2 instead of 2.36e-2), so the default run was not that path.  Q8_0 x q8_1 through
+  llama.cpp's MMQ on sm_61 is dp4a, the study's risk 2 wants it enabled there, and it is.  The FP16 path is the
+  closer one to the F32 oracle (no int8 rounding of the activations), which is what the Q8 column says too.
+- 40 tokens through 3 GDN layers (and 4 with attention): a 60 to 100 ms GPU timeline per run, 36 to 40 ms of it
+  host staging of the unpinned expert blobs; no throughput claim from a 40-token harness (step 5 measures).
 
 ## 4. Git
 
@@ -189,8 +197,6 @@ What the integrator should know:
 
 ## 5. Not done, and surprises
 
-- **The 1080 Ti pass** (section 3.2) waits for the card's lock (held by step3-gdn, then step3-attn, during this
-  session).
 - **The dense ids and scratch on the serve path** are the attention branch's bound (128 blocks per KV head, no ids
   buffer); `qsa_set_bytes` counts no ids rows for a dense model and the scratch at the bounded size.  A 256K
   context on the serve path is step 5's measurement, not this harness's (64 cells).
