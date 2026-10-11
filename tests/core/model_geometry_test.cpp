@@ -202,6 +202,12 @@ int real(const std::string& path) {
     }
     std::printf("%s", strata::core::model_geometry_text(g).c_str());
     try {
+        const std::string guard = strata::check_architecture(strata::GgufFile(path));
+        std::printf("  architecture guard: %s\n", guard.empty() ? "passes" : guard.c_str());
+    } catch (const std::exception& e) {
+        std::printf("  architecture guard: %s\n", e.what());
+    }
+    try {
         if (!forms_ok(path, g, err)) std::printf("  tensor forms: %s\n", err.c_str());
         else std::printf("  tensor forms: separate experts, separate attention projections\n");
     } catch (const std::exception& e) {
@@ -223,7 +229,7 @@ int real(const std::string& path) {
         check(g.hc == 1 && !g.has_ple && !g.has_indexer(), "plain residual, no PLE, no indexer");
         check(std::fabs(g.rms_eps - 1e-6) < 1e-9, "rms eps 1e-6");
     }
-    std::printf("  gate: %s\n", strata::core::qwen35moe_not_yet(g).c_str());
+    if (g.arch == ModelArch::Qwen35Moe) std::printf("  gate: %s\n", strata::core::qwen35moe_not_yet(g).c_str());
     return g_fail ? 1 : 0;
 }
 }  // namespace
