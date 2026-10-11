@@ -1214,17 +1214,25 @@ if(STRATA_NATIVE_EXPERTS)
       # kernel for it before; q5_0/q5_0 (both roles Q5_0) is left out of this list since stacking the same
       # lower-precision format on both roles pushes the GPU path over this test's 3% threshold (quantization
       # noise, not a kernel bug -- see the PR).
-      foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0)
+      foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q6_K/q8_0)
         string(REPLACE "/" "_" _name "${_pair}")
         add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
         set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
       endforeach()
+      # Qwen3.6-35B-A3B's expert pairs at its 2048 x 512 (docs/qwen36-port/step3-experts.md): UD-IQ3_XXS's
+      # IQ2_S/IQ3_XXS (37 layers) and IQ2_S/IQ4_XS (34, 38, 39); UD-Q4_K_XL's Q4_K/Q5_K (37), Q4_K/Q6_K (34, 38)
+      # and Q5_K/Q6_K (39).  The 256-value down types need n_ff % 256 == 0, which 512 has and 640 has not.
+      foreach(_pair iq2_s/iq3_xxs iq2_s/iq4_xs q4_K/q5_K q4_K/q6_K q5_K/q6_K)
+        string(REPLACE "/" "_" _name "${_pair}")
+        add_test(NAME native_expert_parity_qwen36_${_name} COMMAND native_expert_parity --geom 2048x512 --synthetic ${_pair})
+        set_tests_properties(native_expert_parity_qwen36_${_name} PROPERTIES TIMEOUT 120)
+      endforeach()
       add_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
       # #290: the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit
       add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
-      # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
-      add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
-      set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+      # a 256-value down type at Flash-Next's n_ff 640 is refused by native_expert_supported, not run
+      add_test(NAME native_expert_parity_refuses_q6_K_down_at_640 COMMAND native_expert_parity --synthetic q4_K/q6_K)
+      set_tests_properties(native_expert_parity_refuses_q6_K_down_at_640 PROPERTIES WILL_FAIL TRUE)
     endif()
   endif()
   # #296's real-weight checks (OrcaRouter Q4_K_S files; docs/ORCA_Q4_K_S.md) - test programs, not part of a release

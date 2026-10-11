@@ -1,14 +1,21 @@
 // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
 //
-//     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
-//     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
+//     build/native_expert_parity [--geom HxFF] <shard.gguf> [layer ...]   real rows (a split model's shards are
+//                                                                          found by name); expert 7 of each layer
+//     build/native_expert_parity [--geom HxFF] --synthetic GU/DOWN ...    random weights quantized by ggml
+//                                                                          (e.g. q4_K/q5_1, iq2_s/iq3_xxs)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
+//
+// --geom gives n_embd x n_ff (default 2560x640, Flash-Next's; Qwen3.6-35B-A3B is 2048x512).
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
 // activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).  (c) runs
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
+// (e) the negative control: the high byte of one block's fp16 scale flipped (its sign) in one down row must move
+// that row's GPU output by more than 1e-2 relative and no other row by any bit; the same in one gate row must move
+// the output at all (more than 1e-4 relative over every row: one of n_ff SwiGLU terms changes).
 // The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -26,6 +33,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -46,7 +54,26 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 namespace {
 constexpr int NT = 3, E = 7;
-constexpr int64_t H = 2560, FF = 640;
+int64_t H = 2560, FF = 640;   // --geom
+
+// byte offset of the block's fp16 scale `d` inside a block of this type (the negative control flips its high byte)
+size_t scale_byte(int type) {
+    switch (type) {
+        case 14: return ggml_type_size(GGML_TYPE_Q6_K) - sizeof(ggml_fp16_t);   // block_q6_K: ql, qh, scales, then d
+        case 29: return 55;                           // IQ1_M: the top nibble of the last scale word
+        default: return 0;                            // every other format starts with d (or dm: d is its low half)
+    }
+}
+
+// the GPU path on one blob, one group of the NT entries (the activations already in `dxq`)
+void gpu_expert(const strata::kernels::NativeExpertLayout& L, const std::vector<uint8_t>& blob, void* dblob,
+                const void* dxq, void* dscr, float* dout, unsigned long long* dptr, const int32_t* dstart,
+                const int32_t* dn, const int32_t* ddst, const int32_t* dtok, std::vector<float>& got, cudaStream_t s) {
+    cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+    strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+    cudaStreamSynchronize(s);
+    cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);
+}
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
@@ -303,9 +330,34 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
         strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
-        cudaStreamSynchronize(s);
-        cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        gpu_expert(L, blob, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_g, s);
+        {   // (e) the negative control: a flipped scale byte in one down row, then in one gate row
+            const int64_t rd = 5 % H, rg = 3 % FF;   // the corrupted rows
+            std::vector<uint8_t> bad = blob;
+            bad[f.down_off + (size_t) rd * f.d_row + scale_byte(f.d_type)] ^= 0x80;
+            std::vector<float> got_bad(got_g.size());
+            gpu_expert(L, bad, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_bad, s);
+            double num = 0, den = 0;
+            size_t other_rows_differ = 0;
+            for (int k = 0; k < NT; ++k)
+                for (int64_t r = 0; r < H; ++r) {
+                    const float a = got_bad[(size_t) (k * H + r)], b = got_g[(size_t) (k * H + r)];
+                    if (r == rd) { num += std::fabs((double) a - b); den += std::fabs((double) b); }
+                    else other_rows_differ += std::memcmp(&a, &b, 4) != 0;
+                }
+            const double rel_down = num / (den + 1e-30);
+            bad = blob;
+            bad[(size_t) rg * f.gu_row + scale_byte(f.gu_type)] ^= 0x80;
+            gpu_expert(L, bad, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_bad, s);
+            const double rel_gate = rel(got_bad, got_g);
+            const bool seen = rel_down > 1e-2 && other_rows_differ == 0 && rel_gate > 1e-4 && std::isfinite(rel_down) &&
+                              std::isfinite(rel_gate);
+            std::printf("          negative control: down row %lld's scale byte flipped moves that row by rel %.2e "
+                        "(> 1e-2) and %zu other rows by any bit (0); gate row %lld's moves the output by rel %.2e "
+                        "(> 1e-4): %s\n", (long long) rd, rel_down, other_rows_differ, (long long) rg, rel_gate,
+                        seen ? "yes" : "*** NO ***");
+            if (!seen) ++failures;
+        }
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
             // the formats without a decode-once split take the per-entry kernels either way)
             std::vector<float> old_g(got_g.size());
@@ -545,13 +597,22 @@ int main(int argc, char** argv) {
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
-    const std::string mode = argv[1];
+    int ai = 1;
+    if (std::string(argv[ai]) == "--geom") {
+        if (argc < 4 || std::sscanf(argv[ai + 1], "%lldx%lld", (long long*) &H, (long long*) &FF) != 2 || H <= 0 || FF <= 0) {
+            std::fprintf(stderr, "--geom takes HxFF, e.g. 2048x512\n");
+            return 2;
+        }
+        ai += 2;
+    }
+    const std::string mode = argv[ai];
+    std::printf("geometry n_embd %lld x n_ff %lld\n", (long long) H, (long long) FF);
     if (mode == "--q5_1-min") {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
     } else if (mode == "--synthetic") {
-        for (int i = 2; i < argc; ++i) {
+        for (int i = ai + 1; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
@@ -567,9 +628,9 @@ int main(int argc, char** argv) {
             failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
-        const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
+        const strata::GgufModel model(strata::gguf_split_paths(argv[ai]));
         std::vector<int> layers;
-        for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        for (int i = ai + 1; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
         if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};
