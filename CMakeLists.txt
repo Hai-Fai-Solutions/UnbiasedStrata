@@ -735,6 +735,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME gdn_parity COMMAND gdn_parity --selftest)
+  # Qwen3.6 step 3: the decode GDN kernels (all four implementations), the router at 256/8 and the shared expert at
+  # 512 held to ref/qwen36.py's seams on the fixture cmake/qwen36_oracle_dumps.cmake writes (python3 with numpy and
+  # the vendored gguf-py; both tests skip without them)
+  add_executable(qwen36_seam_parity src/kernels/qwen36_seam_parity.cpp)
+  target_include_directories(qwen36_seam_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qwen36_seam_parity PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+  if(NOT _q36_python STREQUAL "")
+    add_test(NAME qwen36_oracle_dumps
+             COMMAND ${CMAKE_COMMAND} -DPYTHON=${_q36_python} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/qwen36_oracle -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qwen36_oracle_dumps.cmake)
+    set_tests_properties(qwen36_oracle_dumps PROPERTIES FIXTURES_SETUP qwen36_oracle_data)
+    add_test(NAME qwen36_seam_parity COMMAND qwen36_seam_parity ${CMAKE_CURRENT_BINARY_DIR}/qwen36_oracle)
+    set_tests_properties(qwen36_seam_parity PROPERTIES FIXTURES_REQUIRED qwen36_oracle_data SKIP_RETURN_CODE 77)
+  endif()
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})
