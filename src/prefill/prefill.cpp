@@ -1064,15 +1064,140 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // drafter's own pass for a ring (the A/B).
     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
     core::QsaState& st = mtp.kv_state_rw();
-    // the drafter's graph below is Flash-Next's (the hyper-connection read, fc_embedding / fc_hidden): Qwen3.6's
-    // nextn block (eh_proj over the concatenation) is step 4's, and the drafter runs its own pass until then
-    if (off || n <= 0 || m.g == nullptr || m.g->arch != core::ModelArch::Qwen4Exp || m.region == nullptr ||
+    if (off || n <= 0 || m.g == nullptr || m.region == nullptr ||
         (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) || st.kv_hybrid || mtp.device() != m.device)
         return false;
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;
     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim, HC = m.geo.hc, LR = m.geo.lr;
     constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
+    static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
+    // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
+    // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
+    static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
+    if (g.arch == core::ModelArch::Qwen35Moe) {
+        // ---- QWEN3.6 (docs/qwen36-port/step4-drafter.md): the nextn block's K/V for the prompt's cells through this
+        // path's GEMMs, the drafter's own graph (core/mtp.cpp record_forward_qwen36) row for row:
+        //   e = rms_norm(embed(next_token)) * enorm;  h = rms_norm(rms_norm(R) * output_norm) * hnorm
+        //   cur = eh_proj . concat(e, h);  x = rms_norm(cur) * attn_norm;  K = rope(k_norm(attn_k . x)), V = attn_v . x
+        // The projections are the pack's native types (Q8_0 in both shipped files); the embedding is the native table.
+        if (!mtp.qwen36()) return false;
+        const float* w_enorm = mtp.tensor_f32("nextn.enorm.weight");
+        const float* w_hnorm = mtp.tensor_f32("nextn.hnorm.weight");
+        const float* w_an = mtp.tensor_f32("attn_norm.weight");
+        const float* w_kn = mtp.tensor_f32("attn_k_norm.weight");
+        int t_eh = -1, t_k = -1, t_v = -1;
+        const void* w_eh = mtp.tensor_native("nextn.eh_proj.weight", &t_eh);
+        const void* w_k = mtp.tensor_native("attn_k.weight", &t_k);
+        const void* w_v = mtp.tensor_native("attn_v.weight", &t_v);
+        const core::WeightRef* wo_norm = m.wt->find("output_norm.weight");
+        const core::NativeEmbed* nemb = core::native_embed();
+        if (!w_enorm || !w_hnorm || !w_an || !w_kn || !w_eh || !w_k || !w_v || nemb == nullptr || wo_norm == nullptr ||
+            wo_norm->data == nullptr || wo_norm->kind != core::WeightKind::F32 || wo_norm->elements != Nn)
+            return false;
+        const float* w_on = (const float*) wo_norm->data;
+        const float eps = (float) g.rms_eps;
+        const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
+        if (r0 >= n) return true;
+        const bool q8 = !f16_only && mmq::built() && mmq::supported(t_eh) && mmq::supported(t_k) && mmq::supported(t_v) &&
+                        mmq::fits(t_eh, Nn) && mmq::fits(t_k, KV) && mmq::fits(t_v, KV);
+        // per row: emb (N) + its fp16 image, hn (N), cat (2N) + fp16, cur (N) + fp16, K and V (KV each), the token;
+        // with MMQ the q8 image of the widest input (2N) and the identity row
+        const uint64_t per_row = 4 * (Nn + Nn + 2 * Nn + Nn + 2 * KV + 1) + 2 * (Nn + 2 * Nn + Nn) + 64 +
+                                 (q8 ? (uint64_t) mmq::q8_bytes(1, 2 * Nn) + 4 : 0);
+        int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+        if (st.kv_mode == 2)
+            B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
+        if (B < 64) return false;
+        uint8_t* q = m.region;
+        auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
+        float* emb = (float*) carve((size_t) B * Nn * 4);
+        uint16_t* emb16 = (uint16_t*) carve((size_t) B * Nn * 2);
+        float* hn = (float*) carve((size_t) B * Nn * 4);
+        float* cat = (float*) carve((size_t) B * 2 * Nn * 4);
+        uint16_t* cat16 = (uint16_t*) carve((size_t) B * 2 * Nn * 2);
+        float* cur = (float*) carve((size_t) B * Nn * 4);
+        uint16_t* cur16 = (uint16_t*) carve((size_t) B * Nn * 2);
+        float* Kc = (float*) carve((size_t) B * KV * 4);
+        float* Vc = (float*) carve((size_t) B * KV * 4);
+        int32_t* tok = (int32_t*) carve((size_t) B * 4);
+        void* xq = q8 ? carve(mmq::q8_bytes(B, 2 * Nn)) : nullptr;
+        int32_t* ident = q8 ? (int32_t*) carve((size_t) B * 4) : nullptr;
+        int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
+        (void) emb16;
+        if ((uint64_t) (q - m.region) > m.region_bytes) return false;
+        if (timing) cudaStreamSynchronize(m.cs);
+        const auto ti0 = Clock::now();
+        if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
+        const double ms_idle = ms_since(ti0);
+        const auto tl0 = Clock::now();
+        const strata::kernels::QsaShapes s = shapes_of(g);
+        std::vector<int32_t> tk((size_t) B);
+        if (q8) {
+            if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+            mmq::iota(ident, B, m.cs);
+        }
+        auto proj = [&](const float* x, uint16_t* x16, int type, const void* w, float* y, int64_t rows, int64_t n_out, int64_t k) {
+            if (!q8) { to_f16(x, x16, rows * k, m.cs); m.gemm.native(x16, type, w, y, rows, n_out, k); return; }
+            mmq::quantize(x, nullptr, xq, type, k, k, rows, m.cs);
+            mmq::Product p;
+            p.w = w; p.type = type; p.w_rows = n_out; p.w_cols = k; p.expert_bytes = mmq::matrix_bytes(type, n_out, k);
+            p.n = 1; p.xq = xq; p.bounds = bnd; p.ids = ident; p.total_rows = rows; p.max_rows = rows;
+            p.dst = y; p.ld_dst = n_out;
+            m.mmq_ctx->run(p, m.cs);
+        };
+        for (int64_t b0 = r0; b0 < n; b0 += B) {
+            const int64_t nb = std::min(B, n - b0), c0 = cell0 + b0;
+            for (int64_t i = 0; i < nb; ++i) tk[(size_t) i] = next_tokens[b0 + i];
+            const int32_t bh[4] = {0, (int32_t) nb, 0, (int32_t) nb};
+            if ((q8 && cudaMemcpyAsync(bnd, bh, sizeof bh, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) ||
+                cudaMemcpyAsync(tok, tk.data(), (size_t) nb * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the draft inputs' upload failed";
+                return false;
+            }
+            // e = rms_norm(embed(token)) * enorm; h = rms_norm(rms_norm(R) * output_norm) * hnorm; concat(e, h)
+            nemb->gather_dev(tok, nb, emb, m.cs);
+            rms_rows(emb, w_enorm, nb, Nn, Nn, eps, m.cs);
+            if (cudaMemcpyAsync(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * Nn * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the draft residual copy failed";
+                return false;
+            }
+            rms_rows(hn, w_on, nb, Nn, Nn, eps, m.cs);
+            rms_rows(hn, w_hnorm, nb, Nn, Nn, eps, m.cs);
+            if (cudaMemcpy2DAsync(cat, (size_t) 2 * Nn * 4, emb, (size_t) Nn * 4, (size_t) Nn * 4, (size_t) nb, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess ||
+                cudaMemcpy2DAsync(cat + Nn, (size_t) 2 * Nn * 4, hn, (size_t) Nn * 4, (size_t) Nn * 4, (size_t) nb, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the draft concat failed";
+                return false;
+            }
+            proj(cat, cat16, t_eh, w_eh, cur, nb, Nn, 2 * Nn);
+            // x = rms_norm(cur) * attn_norm; K and V into the drafter's cache, as the prompt path's attention layers
+            rms_rows(cur, w_an, nb, Nn, Nn, eps, m.cs);
+            proj(cur, cur16, t_k, w_k, Kc, nb, KV, Nn);
+            proj(cur, cur16, t_v, w_v, Vc, nb, KV, Nn);
+            rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, eps, m.cs);
+            rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
+            if (st.kv_rot) {
+                strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
+                strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
+            }
+            if (st.kv_q4) {
+                strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+            } else {
+                kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                          st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
+            }
+        }
+        if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+            err = std::string("prefill: the draft layer's K/V: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        mtp.ms_prefill += ms_since(t0);
+        if (timing)
+            std::fprintf(stderr, "strata draft kv (qwen35moe): %lld cells from %lld (first needed %lld), batch %lld: drafter idle "
+                         "%.1f ms, the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0, (long long) (cell0 + r0),
+                         (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
+        return true;
+    }
     const float* w_ne = mtp.tensor_f32("pre_fc_norm_embedding.weight");
     const void* w_fe = mtp.tensor_q8("fc_embedding.weight");
     const float* w_nh = mtp.tensor_f32("pre_fc_norm_hidden.weight");
@@ -1094,9 +1219,6 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     if (r0 >= n) return true;
     // per row: emb/e2 (N), en16 (N half), hn/h2/Rm/gated (HCN), hn16/xn16 (HCN half), lo (LR) + lo16, grs, mixed (N) +
     // mixed_h, K and V (KV each), the token id
-    // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
-    // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
-    static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);   // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
@@ -1127,7 +1249,6 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
-    static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) cudaStreamSynchronize(m.cs);
     const auto ti0 = Clock::now();
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
