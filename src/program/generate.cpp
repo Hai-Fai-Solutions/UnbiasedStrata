@@ -488,6 +488,11 @@ struct Options {
     int batch_groups = 1;
     std::string spec_oracle;
     int spec_corrupt = 0;
+    /// Qwen3.6 step 4 (docs/qwen36-port/step4-runner.md): with --spec-oracle, every window row is committed and the
+    /// next window starts from the oracle's own token, so the engine is held to a reference continuation (llama.cpp's
+    /// greedy text) position by position; `produced` keeps the engine's picks and --dump-logits writes one row per
+    /// position.  Without it the oracle only drafts.
+    bool teacher_force = false;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
@@ -663,6 +668,9 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --teacher-force      with --spec-oracle FILE: hold the engine to that continuation (every window row\n"
+                 "                       committed, the next window from the oracle's token); --dump-logits then writes\n"
+                 "                       one row per position, and `produced` is what the engine would have picked\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1451,6 +1459,7 @@ int main(int argc, char** argv) {
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--teacher-force") o.teacher_force = true;
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
@@ -1898,6 +1907,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
         return 2;
     }
+    if (o.teacher_force && (o.spec_oracle.empty() || o.serve)) {
+        std::fprintf(stderr, "strata generate: --teacher-force needs --spec-oracle FILE (the continuation to hold the "
+                             "engine to) and is not a --serve mode\n");
+        return 2;
+    }
     if (o.no_ple && !o.ple_gguf.empty()) {
         std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
         return 2;
@@ -2161,9 +2175,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --ram-cap %.2f GiB: the RAM expert tier and the pinned arena are bounded "
                              "to it (the page cache is not: cap it with the machine or a cgroup)\n", o.ram_cap_gib);
     }
-    // ---- THE QWEN3.6 GATE (Phase 2 step 2 of docs/PLAN-qwen36-35b-a3b.md).  The geometry is read, the pack's layout is
-    // checked against it, and the VRAM plan (docs/QWEN36-35B-A3B.md 4.2) is made from this card and this file's census
-    // and printed - then the start stops, saying which steps are not done, instead of failing inside a kernel.
+    // ---- THE QWEN3.6 VRAM PLAN (Phase 2 step 2 of docs/PLAN-qwen36-35b-a3b.md; the plan itself is docs/QWEN36-35B-A3B.md
+    // 4.2).  The geometry is read, the pack's layout is checked against it, and the plan is made from this card and
+    // this file's census and printed; a plan that does not fit stops the start here, before any weight moves.  Until
+    // step 4 (docs/qwen36-port/step4-runner.md) the start stopped here unconditionally (`qwen35moe_not_yet`, the
+    // step-2 gate); the loads that follow are the order pack_load_check.cpp proved on both cards, plus `check_all`
+    // after the native projections.
     if (g.arch == strata::core::ModelArch::Qwen35Moe) {
         strata::plan::VramPlanInput in;
         try {
@@ -2229,35 +2246,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", plan.refusal.c_str());
             return 2;
         }
-        // the expert formats the GPU kernels do not have (the format whitelist below, which the start would refuse
-        // on first): named per layer here as step 3's work, so the gate's output is the whole list
-        {
-            const auto& lay = strata::kernels::cpu::expert_layout();
-            std::map<std::string, std::vector<int64_t>> missing;
-            for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
-                const auto& f = lay.fmt[(size_t) l];
-                if (strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) continue;
-                missing[std::string(strata::ggml_type_name((uint32_t) f.gu_type)) + "/" +
-                        strata::ggml_type_name((uint32_t) f.d_type)].push_back(l);
-            }
-            for (const auto& m : missing) {
-                std::string ls;
-                for (size_t i = 0; i < m.second.size(); ++i) {
-                    if (i == 8 && m.second.size() > 10) { ls += ", ... (" + std::to_string(m.second.size()) + " layers)"; break; }
-                    ls += (i ? ", " : "") + std::to_string(m.second[i]);
-                }
-                std::fprintf(stderr, "strata generate: step 3 also needs GPU expert kernels for gate-up/down %s (%zu layers: %s)\n",
-                             m.first.c_str(), m.second.size(), ls.c_str());
-            }
+        // a native pack decodes in verify windows only (plan v0.3 P6), and this model has no MTP drafter wired yet
+        // (docs/qwen36-port/step4-runner.md: the drafter is `--mtp DIR`, qwen36-step4-drafter): without one the
+        // windows hold one token each and `--spec` is only the verifier's capacity, so a run that asked for none
+        // gets the smallest window the verifier takes instead of the native pack's refusal below
+        if (o.mtp.empty() && o.spec < 2 && !o.serve) {
+            std::fprintf(stderr, "strata generate: no drafter (--mtp): the decode windows hold one token each; --spec %d "
+                                 "becomes 2 (the verifier's smallest window)\n", o.spec);
+            o.spec = 2;
         }
-        std::fprintf(stderr, "strata generate: %s\n", strata::core::qwen35moe_not_yet(g).c_str());
-        return 2;
     }
     {
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
-        // an unsupported dequant type left the prompt path's fp16 buffer unwritten.  (After the Qwen3.6 gate, which
-        // prints the plan and names these formats itself: step 2's gate is what a Qwen3.6 file reaches.)
+        // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
@@ -2526,6 +2528,19 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
+    }
+    // Qwen3.6 (step 4, docs/qwen36-port/step4-pack.md section 6): every layer's names, shapes and engine forms as the
+    // kernels require them (src/core/layout.cpp), now that the arena and the native projections are in place - a
+    // pack that is missing a row, or carries it in the wrong form, is refused here by name instead of inside the
+    // first window.  The whole trunk only: a layer split loads other stages' layers elsewhere.
+    if (g.arch == strata::core::ModelArch::Qwen35Moe && !stage_trim) {
+        if (!strata::core::check_all(wt, g, err)) {
+            std::fprintf(stderr, "strata generate: %s: %s\n", o.pack.c_str(), err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: check_all: %lld layers (%lld attention, %lld GDN): every weight the "
+                             "kernels read is present in its form\n", (long long) g.n_layers,
+                     (long long) g.n_qsa_layers(), (long long) g.n_gdn_layers());
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
@@ -8113,6 +8128,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: cannot read --spec-oracle %s\n", o.spec_oracle.c_str());
                 return 2;
             }
+            if (o.teacher_force && (int64_t) oracle.size() < o.max_new) {
+                std::fprintf(stderr, "strata generate: --teacher-force: the oracle holds %zu tokens, so --max-new %lld "
+                                     "becomes %zu\n", oracle.size(), (long long) o.max_new, oracle.size());
+                o.max_new = (int64_t) oracle.size();
+            }
         }
         if (thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
@@ -8285,6 +8305,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
+        int64_t forced_rows = 0, forced_agree = 0;   // --teacher-force: positions compared, picks equal to the oracle's
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
@@ -8305,9 +8326,14 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            // no draft source (no drafter, no oracle): one token per window - a window padded with token 0 would
+            // verify a draft nobody made (Qwen3.6 step 4: the drafter-off path, docs/qwen36-port/step4-runner.md)
+            if (!use_mtp && oracle.empty()) T = 1;
+            // teacher forcing: the window never runs past the oracle's last token
+            if (o.teacher_force) T = (int) std::min<int64_t>(T, o.max_new - (int64_t) produced.size());
             bool from_sfx = false;
             int sfx_match = 0;
-            if (o.suffix_draft > 0 && !first_window) {
+            if (o.suffix_draft > 0 && !first_window && !o.teacher_force) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
@@ -8348,6 +8374,38 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (o.teacher_force) {
+                // row i's pick against the oracle's token at that position (oracle[j] is the j-th generated token;
+                // `produced` holds j0 of them, so row i of this window predicts oracle[j0 + i]); every row commits
+                for (int i = 0; i < T; ++i) {
+                    const size_t j = produced.size() + (size_t) i;
+                    if (j < oracle.size() && (int64_t) outv[(size_t) i] == oracle[j]) ++forced_agree;
+                    if (j < oracle.size()) ++forced_rows;
+                }
+                a = T - 1;
+            }
+            if (dump != nullptr) {
+                // one row of head logits per emitted position (the accepted rows are the greedy path's positions;
+                // under teacher forcing every row): a native pack writes nothing before this loop, so its header
+                // promises exactly --max-new rows; the token path's header (written with its first row) already counts
+                // these positions
+                if (!hdr_written) {
+                    hdr[1] = (int32_t) o.max_new;
+                    if (std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
+                        std::fprintf(stderr, "strata generate: cannot write logits header\n");
+                        return 1;
+                    }
+                    hdr_written = true;
+                }
+                for (int i = 0; i <= a && (int64_t) produced.size() + i < o.max_new; ++i) {
+                    if (!ver.copy_logits(i, logits.data()) ||
+                        std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                        std::fprintf(stderr, "strata generate: cannot write the window's logits at position %lld\n",
+                                     (long long) (p + i));
+                        return 1;
+                    }
+                }
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -8382,7 +8440,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
-                eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                eos = !o.teacher_force && o.stop_eos &&
+                      std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -8397,7 +8456,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            x = outv[(size_t) a];
+            // the next window's first token: the engine's own pick, or under teacher forcing the oracle's token at
+            // that position (the T rows just committed hold oracle[j0 - 1 .. j0 + T - 2]; the next is oracle[j0 + T - 1])
+            x = o.teacher_force && !produced.empty() && produced.size() - 1 < oracle.size()
+                    ? (int32_t) oracle[produced.size() - 1] : outv[(size_t) a];
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
@@ -8415,6 +8477,10 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
+        if (o.teacher_force)
+            std::printf("%-24s top-1 agreement %lld of %lld positions (%.4f) with %s\n", "teacher-forced",
+                        (long long) forced_agree, (long long) forced_rows,
+                        forced_rows > 0 ? (double) forced_agree / (double) forced_rows : 0.0, o.spec_oracle.c_str());
         if (o.spec_min_p > 0.0) {
             std::printf("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
