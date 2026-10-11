@@ -712,6 +712,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(gemm_bf16_parity src/prefill/gemm_bf16_parity.cu)
     target_link_libraries(gemm_bf16_parity PRIVATE strata_prefill )
     add_test(NAME gemm_bf16_parity COMMAND gemm_bf16_parity)
+    # Qwen3.6 step 3: the prompt path at Qwen3.6's geometry against the oracle's dumps (docs/qwen36-port/step3-prefill.md).
+    # The fixtures (synthetic GGUFs at the real per-layer widths, the oracle's dumps and its rival readings) come from
+    # tests/python/qwen36_prefill_fixture.py with the numpy interpreter probed above; gdn3 is three DeltaNet layers,
+    # full4 adds the attention layer (exit 77 until the attention branch's G = 8 kernels are in the tree)
+    add_executable(prefill_qwen36_test tests/cuda/prefill_qwen36_test.cpp)
+    target_link_libraries(prefill_qwen36_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+    if(NOT _iq_python STREQUAL "")
+      add_test(NAME prefill_qwen36_fixtures
+               COMMAND ${_iq_python} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen36_prefill_fixture.py
+                       --out ${CMAKE_CURRENT_BINARY_DIR}/qwen36_prefill)
+      set_tests_properties(prefill_qwen36_fixtures PROPERTIES FIXTURES_SETUP qwen36_prefill_data SKIP_RETURN_CODE 3
+                           TIMEOUT 1800 ENVIRONMENT "STRATA_GGUF_PY=${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/gguf-py")
+      add_test(NAME prefill_qwen36_test COMMAND prefill_qwen36_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_prefill gdn3)
+      set_tests_properties(prefill_qwen36_test PROPERTIES FIXTURES_REQUIRED qwen36_prefill_data SKIP_RETURN_CODE 77 TIMEOUT 600)
+      add_test(NAME prefill_qwen36_attn_test COMMAND prefill_qwen36_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_prefill full4)
+      set_tests_properties(prefill_qwen36_attn_test PROPERTIES FIXTURES_REQUIRED qwen36_prefill_data SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)

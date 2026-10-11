@@ -260,13 +260,25 @@ struct Alloc {
         const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) { used += bytes; return nullptr; }
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; return nullptr; }
+            if (used + bytes > cap) {
+                if (std::getenv("STRATA_PREFILL_ALLOC_TRACE"))   // which take overflowed its region (a count/carve mismatch)
+                    std::fprintf(stderr, "prefill alloc: %llu bytes do not fit (%llu of %llu used)\n", (unsigned long long) bytes,
+                                 (unsigned long long) used, (unsigned long long) cap);
+                ok = false;
+                return nullptr;
+            }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
         }
         void* p = nullptr;
-        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+        if (const cudaError_t e = cudaMalloc(&p, bytes); e != cudaSuccess) {
+            if (std::getenv("STRATA_PREFILL_ALLOC_TRACE"))
+                std::fprintf(stderr, "prefill alloc: cudaMalloc of %llu bytes: %s\n", (unsigned long long) bytes, cudaGetErrorString(e));
+            cudaGetLastError();
+            ok = false;
+            return nullptr;
+        }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -600,6 +612,7 @@ namespace {
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
+    if (ss.qsa_alloc <= 0) return;   // a model with no attention layer (the harness's gdn3 fixture): no KV to stage
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     if (stage_own() && o_borrowed.count_only) return;
@@ -679,18 +692,29 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     a.take<float>(T * G.kvw, ok); a.take<float>(T * G.kvw, ok); a.take<float>(T * G.qf, ok); a.take<float>(T * G.av, ok);
     if (G.indexer) { a.take<float>(T * s.idx_dim, ok); a.take<float>(T * s.idx_n_head * s.idx_dim, ok); }
     a.take<float>(T * G.av, ok); a.take<uint16_t>(T * G.av, ok);
-    a.take<int32_t>(T * (size_t) cap, ok);
+    if (G.indexer) a.take<int32_t>(T * (size_t) cap, ok);   // dense attention carries no ids (a null is the identity)
     if (G.indexer) a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
     a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
 }
-// The dense model's selection width: every cell of the context (the study's 3.3 item 1: `cap = max_cells`).
-// TODO(qwen36-step3-attn): the attention branch bounds the split-K scratch and the ids rows that scale with it
-// (qsa_decode_attn_scratch_floats(cap) is 64.5 MiB per query row at 262,144 cells); until it lands this takes the
-// context as given, which is what the harness runs at (a few hundred cells) and not what a 256K serve can afford.
-int64_t selection_cap(const core::SessionState& ss, const strata::kernels::QsaShapes& s, const Geom& G) {
-    if (G.indexer) return strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    return ss.qsa_states[ss.qsa_primary()].max_cells;
+// the primary attention state's cells (0 when the model has no attention layer at all: the harness's gdn3 fixture)
+int64_t primary_cells(const core::SessionState& ss) {
+    return ss.qsa_alloc > 0 ? ss.qsa_states[ss.qsa_primary()].max_cells : 0;
+}
+// The attention shapes of this model.  A model without an indexer (Qwen3.6) zeroes the three indexer widths together:
+// that is the kernels' dense signal (qsa_dense; qsa.cu's guard refuses a shape with only some of them zero).
+strata::kernels::QsaShapes shapes_of(const core::ModelGeometry& g) {
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    if (!g.has_indexer()) { s.idx_n_head = 0; s.idx_dim = 0; s.idx_top_k = 0; }
+    return s;
+}
+// The capacity of the per-query selection buffers: the sparse width (2,051) with an indexer, every cell of the
+// context (the primary state's max_cells) for dense attention - qsa_selection_cap, as the attention branch defines
+// it; the dense path carries no ids (a null is the identity) and the split-K scratch is bounded there.
+int64_t selection_cap(const core::SessionState& ss, const strata::kernels::QsaShapes& s) {
+    return std::max<int64_t>(strata::kernels::qsa_selection_cap(primary_cells(ss), s), 1);
 }
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
@@ -887,7 +911,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    if (ss.qsa_alloc > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
@@ -937,11 +961,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (gr && bf16x2_hc()) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    m.cap = selection_cap(ss, s, G);
-    m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    m.cap = selection_cap(ss, s);
+    m.max_blocks = primary_cells(ss) / s.idx_block + 2;
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
@@ -963,7 +985,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.idx_raw = G.indexer ? b.take<float>(T * s.idx_dim, ok) : nullptr;
         m.q_idx = G.indexer ? b.take<float>(T * s.idx_n_head * s.idx_dim, ok) : nullptr;
         m.attn = b.take<float>(T * G.av, ok); m.attn_h = b.take<uint16_t>(T * G.av, ok);
-        m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
+        m.sel_ids = G.indexer ? b.take<int32_t>(T * (size_t) m.cap, ok) : nullptr;
         m.sel_scores = G.indexer ? b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok) : nullptr;
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
@@ -1114,9 +1136,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
     const double ms_idle = ms_since(ti0);
     const auto tl0 = Clock::now();
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
+    const strata::kernels::QsaShapes s = shapes_of(g);
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -1470,11 +1490,9 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     if (gr && bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2()) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    const int64_t cap = selection_cap(ss, s, G);
-    const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    const int64_t cap = selection_cap(ss, s);
+    const int64_t max_blocks = primary_cells(ss) / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T, G), qsa_set_bytes(T, cap, max_blocks, 256, 32, s, G),
                                        moe_set_bytes(T, G, fused_layout(T, true))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>((size_t) (G.ff2 * N), ok); o.take<uint16_t>((size_t) (N * G.ff), ok); }
@@ -1648,9 +1666,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
+    const strata::kernels::QsaShapes s = shapes_of(g);
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
@@ -1814,12 +1830,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) {
-            int32_t* step = m.steps_host.data() + t * strata::kernels::kStepCount;
-            strata::kernels::qsa_step_fill(step, p0 + t, s);
-            // dense attention (no indexer): the selection is every cell up to the query's own, as far as `cap` holds
-            if (!G.indexer) step[strata::kernels::kStepWidth] = (int32_t) std::min<int64_t>(p0 + t + 1, m.cap);
-        }
+        // (dense attention: qsa_step_fill's width is n_kv itself, every cell up to the query's own)
+        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
         cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
                         cudaMemcpyHostToDevice, m.cs);
 
@@ -2211,19 +2223,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     rms_rows(m.q, (const float*) wqn->data, T * G.nh, 256, 256, EPS, m.cs);
                     rope(m.q, T, G.nh, 256, G.av, p0, strata::kernels::rope_scaling(), m.cs);
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * G.nh, m.cs);
+                    // dense attention (no indexer): every cell up to the query's own - the width in the step records,
+                    // a null ids as the identity selection (the attention branch's kernels, G templated at 2 / 8 / 12
+                    // query heads per KV head; any other ratio is refused by name before a launch)
                     if (!G.indexer) {
-                        // dense attention: every cell up to the query's own (the width in the step records), no
-                        // indexer, no selection.  TODO(qwen36-step3-attn): the kernels below are the QSA ones at
-                        // G = 12 query heads per KV head and refuse 16 / 2 (qsa_decode_attn.cu:17, qsa_prompt_attn.cu:22);
-                        // the attention branch templates G at 8 and bounds the split-K scratch.  Until it lands this
-                        // layer is refused here, with an error string, rather than mis-indexed.
-                        if (G.nh != 12 * G.nkv) {
-                            err = "prefill: dense attention at " + std::to_string(G.nh) + " heads / " + std::to_string(G.nkv) +
-                                  " KV heads needs the G = 8 attention kernels (branch qwen36-step3-attn, not landed here)";
-                            return false;
-                        }
-                        pt.mark(kPfQsaSel, cs);
-                        dense_ids(m.sel_ids, m.steps_dev, m.cap, T, m.cs);
+                        char why[256] = {0};
+                        if (strata::kernels::qsa_attn_group(s, why, sizeof why) == 0) { err = std::string("prefill: ") + why; return false; }
                     }
                     if (G.indexer) {
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
@@ -2363,7 +2368,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * G.av, pools, m.sel_ids + t0 * m.cap,
+                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * G.av, pools, m.sel_ids ? m.sel_ids + t0 * m.cap : nullptr,
                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
                                                                    s, m.attn_scratch, m.attn + t0 * G.av, nb, m.cs);
                         }

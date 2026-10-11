@@ -100,8 +100,6 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, int64_t n_head, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, int64_t n_head, void* stream);
-/// The dense selection (Qwen3.6, no indexer): ids[t, i] = i for i < steps[t][kStepWidth], rows of `cap`.
-void dense_ids(int32_t* ids, const int32_t* steps, int64_t cap, int64_t T, void* stream);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.

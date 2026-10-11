@@ -1,7 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
-#include "strata/kernels/qsa.hpp"
 #include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
@@ -677,14 +676,7 @@ __global__ void residual_add_kernel(float* __restrict__ R, const float* __restri
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         R[i] += bo[i];
 }
-// the dense selection: every cell up to the query's own, ids[t, i] = i for i < steps[t][kStepWidth]
-__global__ void dense_ids_kernel(int32_t* __restrict__ ids, const int32_t* __restrict__ steps, int64_t cap, int64_t T) {
-    const int64_t t = blockIdx.y;
-    if (t >= T) return;
-    const int32_t width = steps[t * strata::kernels::kStepCount + strata::kernels::kStepWidth];
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < width && i < cap; i += (int64_t) gridDim.x * blockDim.x)
-        ids[t * cap + i] = (int32_t) i;
-}
+
 
 // ---------------------------------------------------------------- MoE
 // softmax over REG * 32 experts, the top k (<= 32) by rank with ties to the lower id, the k weights renormalised with
@@ -1045,12 +1037,7 @@ void residual_add(float* R, const float* bo, int64_t n, void* stream) {
     residual_add_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(R, bo, n);
     check("residual_add");
 }
-void dense_ids(int32_t* ids, const int32_t* steps, int64_t cap, int64_t T, void* stream) {
-    if (T <= 0 || cap <= 0) return;
-    const int64_t bx = (cap + 255) / 256;
-    dense_ids_kernel<<<dim3((unsigned) (bx < 64 ? bx : 64), (unsigned) T), 256, 0, (cudaStream_t) stream>>>(ids, steps, cap, T);
-    check("dense_ids");
-}
+
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant");
