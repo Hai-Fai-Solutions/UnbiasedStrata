@@ -70,6 +70,24 @@ Hypotheses:
 H4 and H5 are not a go/no-go for building the engine; the port is the deliverable regardless. They decide
 how the README describes the result and where the expert-cache tuning effort goes.
 
+**Measured on 2026-10-11 (Phase 0; details in `~/Code/regina/analysis/qwen36-35b-single-gpu-ladder/`):**
+
+| | Q4_K_XL at 11 GB | IQ3_XXS at 11 GB |
+| --- | --- | --- |
+| llama.cpp, 256K, fit edge (`--n-cpu-moe` 32 / 18) | 8.8 tok/s decode, 129 prefill, GPU busy 15% | 24.6 tok/s decode, 434 prefill, GPU busy 41% |
+| Route trace, top 40% of experts per layer | 76% of routes (215K routed tokens) | |
+| Replay, LFU with 3 spares per layer, VRAM slots per layer | 76 slots: 82.6% hit, 42.5 RAM and 13.2 disk reads per token | 156 slots: 96.0% hit, 12.7 RAM and 0 disk reads |
+| Replay, Belady ceiling | 91.0% hit, 6.6 disk reads | 98.2% hit |
+| Predicted decode, overlap / serial (gpu 17 ms, CPU lane 0.15 ms per expert, disk 1.3 ms; parameters, not measurements) | 42.5 / 24.7 tok/s | 58.8 / 52.9 tok/s |
+
+Readings: H1 holds (the GPU idles 85% of each Q4 step, 59% at IQ3). H4 holds (83% hit from 30% of the
+experts). With 12 GiB of RAM the Q4 arm is disk-limited (13 disk reads per token, about 17 ms, as long
+as the whole GPU step), so on this rung IQ3 is the quant that reaches the GPU ceiling and Q4 needs either
+16 GiB of RAM or 12 GB of VRAM. Prefill hit rates are linear in slots (a prompt touches nearly every
+expert per layer per ubatch), so prompts stream experts over PCIe, as Strata already does. The overlap
+column saturates at `1000 / gpu_ms`; the GPU step itself is the next thing to measure properly (nvprof,
+in the sweep).
+
 ## 1. The card ladder
 
 Real cards in the homelab cover the range, with Pascal at three sizes:
