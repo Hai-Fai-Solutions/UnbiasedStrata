@@ -1640,7 +1640,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const Geom& G = m.geo;
-    const int64_t N = G.n, HC = G.hc, D = G.d, K = G.k, ZV = G.zv, HV = G.hv;
+    const int64_t N = G.n, HC = G.hc, D = G.d, K = G.k, HV = G.hv;
     const bool plain = HC == 1;   // the plain residual block (Qwen3.6): no hyper-connection read or write
     const GdnGeom gdn_geom = G.gdn();
     const auto t_start = Clock::now();
@@ -2383,7 +2383,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, K, m.cs);
-                    if (on_seam && !on_seam("ffn_moe_topk", l, (const float*) m.ids, T, K, p0, err)) return false;
+                    if (on_seam && !on_seam("ffn_moe_topk", l, (float*) m.ids, T, K, p0, err)) return false;   // int32 ids as floats
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
