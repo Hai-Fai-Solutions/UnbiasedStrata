@@ -116,6 +116,11 @@ def write(path: str, c: qs.Cfg) -> tuple[int, int]:
             w.add_tensor(name, quants.quantize(arr, Q.Q8_0), raw_dtype=Q.Q8_0)   # the byte shape; gguf-py derives the elements
             nq += 1
         elif name.endswith(BF16_SUFFIXES):
+            # the router's logits at half the toy's gain: with 16 experts at the toy's spread the top-8 carry 99 % of the
+            # softmax mass and the renormalisation rival (router_norm=False) moves ffn_out by 1 %, invisible to a 5 %
+            # gate; at this gain the top-8 carry less and the rival is seen (the harness measures both)
+            if name.endswith(".ffn_gate_inp.weight"):
+                arr = (arr * 0.5).astype(np.float32)
             w.add_tensor(name, to_bf16_exact(arr))
         else:
             w.add_tensor(name, arr)
