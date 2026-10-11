@@ -867,8 +867,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(qsa_attn_bench src/kernels/qsa_attn_bench.cpp)
   target_include_directories(qsa_attn_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(qsa_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-  add_test(NAME qsa_attn_bench COMMAND qsa_attn_bench --heads 16,2 --cells 2051,8192 --reps 10)
-  set_tests_properties(qsa_attn_bench PROPERTIES SKIP_RETURN_CODE 77)
+  # a benchmark, not a test: it asserts nothing, so it is a target and not a CTest entry
 
   # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
   # kernel's reach, with tied and with equal scores (synthetic, no model)
