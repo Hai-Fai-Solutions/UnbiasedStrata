@@ -3,7 +3,7 @@
 // The inputs are the study's fixed set (table 4.1: weights 2,038 / 1,597 MiB, drafter ~520, KV 1,440 MiB at
 // 262,144 as q4_0 over 10 attention layers = 5,760 B per token, session ~164, CUDA context ~300, the 300 MiB small
 // reserve, prompt buffers 1,904 / 1,878 MiB when prefill does not borrow) and the census of the two files
-// (tests/data/native_experts/qwen36-*.txt: 19,636,158,464 and 11,108,614,144 B over 40 x 256 experts, the "1.829 /
+// (tests/data/native_experts/qwen36-*.txt: 19,635,634,176 and 11,108,614,144 B over 40 x 256 experts, the "1.829 /
 // 1.035 MiB mean blob").  Each ladder row is checked two ways: exactly against the derivation
 // floor((budget - fixed) / blob), and within the table's rounding (its values are rounded to tens) of the number
 // the study printed.  Then the rule's other branches: the context lowered toward 131,072 when the request does
@@ -26,7 +26,7 @@ void check(bool ok, const std::string& what) {
 }
 constexpr uint64_t MiB = 1u << 20;
 constexpr int64_t kExperts = 40 * 256;
-constexpr uint64_t kQ4Total = 19636158464ull, kIq3Total = 11108614144ull;   // the two files' expert bytes (census)
+constexpr uint64_t kQ4Total = 19635634176ull, kIq3Total = 11108614144ull;   // the two files' expert bytes (census)
 constexpr uint64_t kQ4Blob = kQ4Total / kExperts, kIq3Blob = kIq3Total / kExperts;
 constexpr uint64_t kKvPerToken = 5760;   // q4_0 K and V, 2 KV heads x 256, 10 layers: 1,440 MiB at 262,144
 
