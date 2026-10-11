@@ -113,21 +113,41 @@ so the new types cost what their bytes cost; the 8 x 4 row shows the per-entry k
 `Split<>`, the dot redone per entry) against the decode-once ones (IQ3_XXS, IQ4_XS). The 1080 Ti numbers (section 5)
 set the step-5 budget.
 
-## 5. Results, GTX 1080 Ti (VM 211, sm_61)
+## 5. Results, GTX 1080 Ti (VM 211, sm_61, CUDA 12.4, gcc-13)
 
-Not run yet. The tree is staged at `/home/rk/qwen36-step3-experts/` with `run-vm211.sh` (configure with
-`-DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=61 -DSTRATA_MMQ_KQUANTS=ON`, the five test targets, the
-ctest set, both real files at layers 0 / 34 / 39, `--bench-down`, the lock released at the end; logs in its `logs/`,
-`status.txt` and `DONE`). The card was taken all evening of 2026-10-11 by `sweep_ladder_1080ti.py` (the Phase 0
-sweep, relaunching `llama-server` per rung, running without the lock file) and, from 19:20 UTC, by the
-`qwen36-step3-attn` lock beside it; the rules' 30-minute wait expired. To run it once the card is free:
+`/home/rk/qwen36-step3-experts/run-vm211.sh` under the lock (2026-10-11, 20:02 UTC): configure with
+`-DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=61 -DSTRATA_MMQ_KQUANTS=ON` (5 s), the five test targets
+(149 s at `-j 8`), then the same three commands as section 4 with `/home/rk/models/` for the files; logs in its
+`logs/`. No guard was needed: the new kernels use `__dp4a`, `__vsubss4`, `__byte_perm` and fp16 conversions only.
 
-    ssh rk@192.168.50.43 'set -o noclobber; echo qwen36-step3-experts > /home/rk/VM-BUSY && nohup /home/rk/qwen36-step3-experts/run-vm211.sh > /home/rk/qwen36-step3-experts/logs/nohup.log 2>&1 &'
-    # then: cat /home/rk/qwen36-step3-experts/logs/{status.txt,ctest.log,realfile.log,bench-down.log}
+- ctest: 20 of 20 pass (the 15 `native_expert_parity_*`, `native_grouped_parity`, `iq_multi_parity`, `iq_parity`
+  with its fixture, `prefill_mmq_kquant_test` through llama.cpp's dp4a MMQ tiles on cc 61).
+- Real files, both 0 failures, the same numbers as the 4090 to the printed digits (the kernels are integer dp4a
+  chains with one float expression per block; the q8_1 rounding is the same): UD-IQ3_XXS layers 0 / 34 / 39 gpu
+  9.7e-3 / 1.2e-2 / 1.1e-2, UD-Q4_K_XL layers 0 / 34 / 39 (q4_K/q5_K, q4_K/q6_K, q5_K/q6_K) 1.1e-2 / 1.2e-2 /
+  1.2e-2; GPU dequantization bit-exact for every matrix; the negative control's down-row move 1.8e-1 to 1.6 with no
+  other row touched, the gate-row move 3.5e-4 to 3.4e-3.
+- `native_grouped_parity`: all 96 pairs at 512 x 256 and the seven model shapes bitwise equal to v1.
 
-The kernels added use `__dp4a`, `__vsubss4`, `__byte_perm` and fp16 conversions only, the same set the existing
-Q4_K / Q5_K / Q5_1 kernels compile from on sm_61 (`pascal-build.md`), so the sm_61 build is expected to need no
-guard; the per-expert down times on this card are the step-5 budget and are still to be measured.
+The down kernel alone per expert at 2048 x 512 (`--bench-down`, SM 1873 MHz, memory 5508 MHz, 46 C), the step-5
+budget:
+
+| down type | MB / expert | 32 groups x 1 entry | 8 groups x 4 entries (per group) |
+| --- | ---: | ---: | ---: |
+| Q5_1 (the comparator) | 0.786 | 4.43 | 14.3 |
+| Q8_0 | 1.114 | 7.58 | 25.3 |
+| IQ4_XS | 0.557 | 6.58 | 12.1 |
+| IQ3_XXS | 0.401 | 6.78 | 10.8 |
+| Q5_K | 0.721 | 4.29 | 12.2 |
+| Q6_K | 0.860 | 5.32 | 15.6 |
+
+Against Q5_1 at one entry per expert: Q5_K 0.97x, Q6_K 1.20x, IQ3_XXS 1.53x, IQ4_XS 1.49x. Pascal is not
+bandwidth-bound here (Q5_1: 25 MB per 142 us call, 178 GB/s of the card's 484): the i-quant down types pay their
+grid lookups and sign unpacking per call, so IQ3_XXS costs 1.5x Q5_1's time for half its bytes, while the K-quants'
+plain nibble chains run at Q5_1's speed. At four entries per expert the decode-once kernels (IQ3_XXS, IQ4_XS) amortise
+and come out ahead of the per-entry Q5_K / Q6_K. For a window of 4 tokens x top-8 routed to 32 distinct experts the
+down projection is 137 to 217 us per layer, 5.5 to 8.7 ms over 40 layers; the gate/up (twice the rows at the wider
+n_embd) is the larger half and was not re-timed here (the Flash-Next numbers in `native_grouped_parity --bench` stand).
 
 ## 6. Surprises
 
