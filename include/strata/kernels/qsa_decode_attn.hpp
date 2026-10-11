@@ -17,7 +17,7 @@
 // `qsa_attn_group` picks it from the geometry and refuses any other ratio by name); a NULL `ids` is the identity
 // selection, cell j = j for j < step[kStepWidth], which is dense attention without an ids buffer (prefill at
 // 2,048 queries x 262,144 cells would otherwise carry 2 GiB of ids); and the number of blocks per KV head is
-// capped at 128 so the split-K partials are bounded at 2 MiB per query row (16 heads) instead of growing to
+// capped at 128 so the split-K partials are bounded at 2.02 MiB per query row (16 heads) instead of growing to
 // 64.5 MiB at 262,144 cells - each block walks its share of the selection in 64-cell sub-chunks with an online
 // rescale, computed from the token's width on the device, so a short selection keeps one block per 64 cells.
 #pragma once
@@ -52,7 +52,7 @@ bool qsa_attn_group_check(const QsaShapes& s, int G, char* why, size_t why_len);
 int64_t qsa_decode_attn_chunks(int64_t cap);
 
 /// Scratch floats per query row for `cap` selected cells: `chunks(cap) * n_head * 258 + 64` (partial
-/// accumulators, maxima and sums).  Bounded: 2,080,832 floats (7.9 MiB) at 16 heads for any cap >= 8,192.
+/// accumulators, maxima and sums).  Bounded: 528,448 floats (2.02 MiB) at 16 heads for any cap >= 8,192.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
 /// `ids` (cap,) i32 or NULL for the identity selection (every cell up to step[kStepWidth]).

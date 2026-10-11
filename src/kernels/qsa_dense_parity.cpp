@@ -294,9 +294,9 @@ void section_dispatch() {
     const uint64_t old2051 = 33ull * 24 * 258 + 64, new262k = 128ull * 16 * 258 + 64;
     verdict("scratch at cap 2,051 x 24 heads is the old formula (33 x 24 x 258 + 64 floats)",
             k::qsa_decode_attn_scratch_floats(2051, s24) == old2051);
-    verdict("scratch at cap 262,144 x 16 heads is 128 x 16 x 258 + 64 floats = 2,080,832 (7.9 MiB), not 64.5 MiB",
-            k::qsa_decode_attn_scratch_floats(262144, s16) == new262k && new262k * 4 < 8ull * 1048576,
-            std::to_string(new262k * 4 / 1048576) + " MiB");
+    verdict("scratch at cap 262,144 x 16 heads is 128 x 16 x 258 + 64 floats = 528,448 (2.02 MiB), not 64.5 MiB",
+            k::qsa_decode_attn_scratch_floats(262144, s16) == new262k && new262k == 528448,
+            std::to_string(new262k * 4 / 1024) + " KiB");
 }
 
 // ================= 2. the decode kernel against the host reference, every KV format, three widths =================
@@ -434,7 +434,12 @@ void section_fixture(const fs::path& dir, const std::string& name) {
         return v;
     };
     const auto wqn = tensor("blk.3.attn_q_norm.weight", HD), wkn = tensor("blk.3.attn_k_norm.weight", HD);
-    auto seam = [&](const std::string& nm, size_t n) { return load_f32(dump / (nm + "-" + std::to_string(L) + ".f32"), n); };
+    // the oracle's file names: <name>-<layer>.f32, a repeated name numbered <name>-<layer>#2.f32 (oracle-crosscheck.md)
+    auto seam = [&](const std::string& nm, size_t n) {
+        const size_t hash = nm.find('#');
+        const std::string base = nm.substr(0, hash), rep = hash == std::string::npos ? "" : nm.substr(hash);
+        return load_f32(dump / (base + "-" + std::to_string(L) + rep + ".f32"), n);
+    };
     const auto q_pre = seam("Qcur_reshaped", T * NH * HD);        // [t][h][d], before the norm
     const auto k_pre = seam("Kcur", T * NKV * HD);                 // [t][kv*HD + d], the projection
     const auto v_in = seam("Vcur#2", T * NKV * HD);                // [t][kv][d]

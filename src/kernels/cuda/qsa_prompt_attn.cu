@@ -416,7 +416,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = warp * 64 + j * 8 + 2 * tig;
-        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid < G)   // G < 8 (the fixtures' 4 / 2): rows past G belong to the next KV head's output
+            *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
     }
@@ -671,7 +672,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = dim0 + j * 8 + 2 * tig;
-        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid < G)   // G < 8 (the fixtures' 4 / 2): rows past G belong to the next KV head's output
+            *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
     }
@@ -1117,7 +1119,7 @@ bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
     return true;
 }
 #else   // AMD, or a build without STRATA_EXPERIMENTAL_SM60: no m8n8k4 kernel (the caller keeps the old one)
-template <int KV_MODE>
+template <int KV_MODE, int G>
 bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
               int64_t, cudaStream_t) {
     return false;

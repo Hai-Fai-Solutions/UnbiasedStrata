@@ -88,7 +88,10 @@ void check_sync(const char* what) {
 /// Geometry validation.  A silently wrong `head_dim % 4` would corrupt the gather's uint2 copy and a silently
 /// wrong `n_head % n_head_kv` would produce a plausible attention with the wrong key, so both are refused.
 void validate(const QsaShapes& s, const char* who) {
-    if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_dim <= 0 || s.idx_n_head <= 0 ||
+    // dense attention (Qwen3.6, qsa_dense): no indexer, so the three indexer widths are 0 together; the KV, gather,
+    // attend and gate kernels do not read them.  A shape with SOME of them zero is a half-set-up geometry.
+    const bool dense = s.idx_n_head == 0 && s.idx_dim == 0 && s.idx_top_k == 0;
+    if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || (!dense && (s.idx_dim <= 0 || s.idx_n_head <= 0)) ||
         s.idx_block < 2 || s.page_size < 1) {
         std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
         std::exit(1);
@@ -103,7 +106,7 @@ void validate(const QsaShapes& s, const char* who) {
                      (long long) s.head_dim);
         std::exit(1);
     }
-    if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) {
+    if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || (!dense && s.n_rot > s.idx_dim)) {
         std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
                      (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
         std::exit(1);
@@ -111,6 +114,14 @@ void validate(const QsaShapes& s, const char* who) {
     if (s.idx_n_head > 32) {
         std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
                      (long long) s.idx_n_head);
+        std::exit(1);
+    }
+}
+/// The indexer's own entry points: a dense shape (no indexer) has nothing for them to read.
+void validate_indexer(const QsaShapes& s, const char* who) {
+    validate(s, who);
+    if (qsa_dense(s)) {
+        std::fprintf(stderr, "qsa: %s: the geometry has no indexer (dense attention); nothing to score or select\n", who);
         std::exit(1);
     }
 }
@@ -607,7 +618,7 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
                     const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream) {
-    validate(s, "qsa_index");
+    validate_indexer(s, "qsa_index");
     if (step == nullptr) fail("qsa_index: step is null");
     if (max_blocks <= 0) fail("qsa_index: max_blocks must be positive");
     // THE GRID IS `max_blocks`, A CONSTANT - not this token's `n_bid + 1`.  The kernel returns for
@@ -621,7 +632,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
 
 void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
                    int32_t* ids, void* stream) {
-    validate(s, "topk_512");
+    validate_indexer(s, "topk_512");
     if (step == nullptr) fail("topk_512: step is null");
     // `cap` is checked against the GEOMETRY'S largest possible width rather than this token's, because this
     // token's is a device value.  The two are the same guarantee: `width = min(n_kv, top_k + r - 1)` and
@@ -722,7 +733,7 @@ void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, in
 void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream) {
-    validate(s, "indexer_key_append");
+    validate_indexer(s, "indexer_key_append");
     if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
     if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
@@ -740,7 +751,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
 
 void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
                int64_t n_kv, float* cell_scores, void* stream) {
-    validate(s, "qsa_index");
+    validate_indexer(s, "qsa_index");
     if (n_bid < 0 || n_kv <= 0) fail("qsa_index: n_bid < 0 or n_kv <= 0");
     // `n_kv`, `n_bid` and `width` are DERIVED from one position, so this refuses a caller whose two arguments
     // disagree rather than launching a kernel that would score the wrong number of blocks.
@@ -756,7 +767,7 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
 
 void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
               void* stream) {
-    validate(s, "topk_512");
+    validate_indexer(s, "topk_512");
     if (n_kv <= 0) return;
     if (n_kv > kTopkMaxCells) {
         std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
