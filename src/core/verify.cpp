@@ -372,8 +372,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     n_vocab_ = wo->ne1;
 
     const strata::kernels::QsaShapes s = shapes_of(g);
-    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    cap_ = strata::kernels::qsa_selection_cap(ss.qsa_states[ss.qsa_primary()].max_cells, s);   // dense: max_cells
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    const bool dense = strata::kernels::qsa_dense(s);   // Qwen3.6: no indexer, no selection buffers (3.3)
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
@@ -440,7 +441,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
-        scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+        if (!dense) { scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_); }
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -807,12 +808,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
                 const QsaState& st = ss.qsa_states[qi];
-                const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
+                // Qwen3.6 (3.3): dense attention - no indexer tensors, no raw key, no scores, no top-k; the split-K
+                // kernel reads every cell (a null ids is the identity) with the width n_kv from each row's step
+                const bool has_idx = g.has_indexer();
+                const WeightRef *wq = need(v, "attn_q.weight", err),
                                 *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
-                                *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
-                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
-                                *wiqn = need(v, "indexer.q_norm.weight", err), *wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                                *wo = need(v, "attn_output.weight", err),
+                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err);
+                const WeightRef *wik = has_idx ? need(v, "indexer.k_proj.weight", err) : nullptr,
+                                *wiq = has_idx ? need(v, "indexer.q_proj.weight", err) : nullptr,
+                                *wiqn = has_idx ? need(v, "indexer.q_norm.weight", err) : nullptr,
+                                *wikn = has_idx ? need(v, "indexer.k_norm.weight", err) : nullptr;
+                if (!wq || !wk || !wv || !wo || !wqn || !wkn || (has_idx && (!wik || !wiq || !wiqn || !wikn))) return false;
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
@@ -827,7 +834,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                if (!has_idx) {}
+                else if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
@@ -842,7 +850,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (batch_rec_) {   // every slot's indexer tail, restored by its commit
+                if (!has_idx) {}
+                else if (batch_rec_) {   // every slot's indexer tail, restored by its commit
                     for (int t = tb; t < te; ++t)
                         copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS, slot_ss(t).qsa_states[qi].idx_tail,
                                          TS, cs);
@@ -866,6 +875,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
+                if (has_idx)
                 for (int t = tb; t < te; ++t) {
                     const QsaState& sx = slot_ss(t).qsa_states[qi];
                     const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
@@ -884,9 +894,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    if (has_idx) {
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
+                    }
                 } else {
                 for (int t = tb; t < te; ++t) {
                     float* qc = qcur_ + t * NH * HD;
@@ -898,6 +910,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
                     if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
+                if (has_idx)
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
@@ -905,6 +918,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 stamp(l, 10, grp);
+                if (!has_idx && batch_rec_) {   // dense, each row over its own slot's K/V: every cell, no ids
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        const QsaAttnPools px = qsa_attn_pools(sx);
+                        qsa_decode_attn_batch(qcur_ + t * NH * HD, px, nullptr, step_ + t * kStepCount, cap_, s,
+                                              attn_scratch_ + (size_t) t * attn_scratch_floats_, attn_ + t * NH * HD, 1, cs);
+                    }
+                } else if (!has_idx) {   // dense: the n rows over every cell of the shared state, no ids
+                    stamp(l, 11, grp);
+                    stamp(l, 12, grp);
+                    const QsaAttnPools pools = qsa_attn_pools(st);
+                    qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, nullptr, step_ + tb * kStepCount, cap_, s,
+                                          attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                } else
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
