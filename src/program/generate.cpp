@@ -2201,7 +2201,8 @@ int main(int argc, char** argv) {
         {
             strata::core::detail::HostMemory hm;
             in.ram_available_bytes = strata::core::detail::host_available_memory(hm) ? hm.available : 0;
-            in.ram_headroom_bytes = o.resident_headroom;
+            // the RAM tier's headroom: --resident-experts' 4 GiB (the study's), unless the resident mode set its own
+            in.ram_headroom_bytes = o.resident_cpu_experts ? o.resident_headroom : (4ull << 30);
         }
         if (o.native_preset.find("IQ3") == std::string::npos) in.smaller_file = "Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf";
         const strata::plan::VramPlan plan = strata::plan::make_vram_plan(in);
