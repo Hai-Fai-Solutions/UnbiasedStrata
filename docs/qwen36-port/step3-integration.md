@@ -33,7 +33,15 @@ on both cards; the per-seam numbers are in each area's notes and are identical o
    a different summation order; drafts are verified, so draft quality, not correctness. Fix: sparse-model shapes keep
    the previous grid.
 3. LOW: the prefill fixture failed instead of skipping without numpy (fixed, c4f599f); native_expert_parity's 3e-2
-   bound tightened to the policy's 2e-2 with separate CPU rows (77983af); `qsa_attn_bench` registered as a test.
+   bound tightened to the policy's 2e-2 with separate CPU rows (77983af); `qsa_attn_bench` registered as a test
+   (removed from the suite).
+
+All fixed on the attention branch and cherry-picked here (one builder `strata::core::qsa_shapes(g)` in
+`include/strata/core/qsa_shapes.hpp` used by layer, verify, mtp, session and prefill, the last by delegation from
+prefill's `shapes_of`; `qsa_dense()` and the kernels' guard test the same three-zero predicate; the split-K bound applies
+to dense shapes only, so Flash-Next's drafter keeps its 512-block grid and 12.09 MiB scratch, A/B equal within 1 us on
+the 1080 Ti). After the fixes: 4090 88 of 91 (the same three host failures); 1080 Ti incremental build 81 s, the 33
+attention / prefill / expert / verify tests 33 of 33.
 4. NOTE: the GDN head pairing is tiled (`h % 16`), as llama.cpp, the oracle and the engine all have it; the reviewer's
    brief had said interleaved, which is the oracle's negative control.
 
