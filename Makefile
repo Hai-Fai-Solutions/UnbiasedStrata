@@ -4,7 +4,7 @@ BUILD_DIR  ?= build
 # Pascal (61) and Volta (70) are the experimental build (STRATA_EXPERIMENTAL_SM60, a CUDA 12.x toolkit): any arch below
 # 75 in the list switches it on - `make build CUDA_ARCHS=61` on the GTX 10 series (docs/qwen36-port/pascal-build.md).
 CUDA_ARCHS ?= 86;89;120
-SM60 := $(shell for a in $$(echo "$(CUDA_ARCHS)" | tr ';' ' '); do b=$${a%%-*}; case $$b in native|all|all-major) ;; *) [ "$$b" -lt 75 ] 2>/dev/null && echo ON;; esac; done | head -1)
+SM60 := $(shell echo "$(CUDA_ARCHS)" | tr ';' '\n' | sed 's/-.*//' | grep -E '^[0-9]+$$' | awk '$$1 < 75 { print "ON"; exit }')
 SM60_FLAG := $(if $(SM60),-DSTRATA_EXPERIMENTAL_SM60=ON,)
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
