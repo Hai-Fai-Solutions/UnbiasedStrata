@@ -473,16 +473,21 @@ bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer
     if (!moe_shared(tables, g, layer, b, x, stream, err)) return false;
     return moe_combine_parts(g, layer, k, b, parts, out, stream, err);
 }
-bool layer_verify_compatible(std::string& why) {
-    // Plan v0.3 P6: the verify window reproduces exactly this configuration's per-token arithmetic.
+bool layer_verify_compatible(const ModelGeometry& g, std::string& why) {
+    // Plan v0.3 P6: the verify window reproduces exactly this configuration's per-token arithmetic.  At hc = 1 the
+    // block has no hyper-connection read (the plain path, below) and without an indexer no selection to make.
     if (!native_bf16_projections) why = "the native BF16 projections are off";
-    else if (!g_fused_gr) why = "the fused hyper-connection read is off";
+    else if (g.hc > 1 && !g_fused_gr) why = "the fused hyper-connection read is off";
     else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
     else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
-    else if (!g_fast_select) why = "the block top-k selection is off";
-    else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
+    else if (g.has_indexer() && !g_fast_select) why = "the block top-k selection is off";
+    else if (g.has_indexer() && !strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
     else return true;
     return false;
+}
+bool layer_verify_compatible(std::string& why) {
+    const ModelGeometry flash_next;   // the defaults: hc 4 with the indexer
+    return layer_verify_compatible(flash_next, why);
 }
 void layer_set_publish_kernel(bool enabled) { g_publish_kernel = enabled; }
 void layer_set_fused_gdn(bool enabled) { g_fused_gdn = enabled; }
@@ -1087,6 +1092,20 @@ bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token,
 }
 bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockBuffers& bb,
                  void* stream, std::string& err) {
+    if (g.hc == 1) {
+        // the plain head: `result_norm = rms_norm(R) * output_norm` (qwen35moe.cpp:230-233), one stream, no mix
+        const WeightRef* wn = tables.find("output_norm.weight");
+        if (!wn) { err = "lm_head: output_norm.weight is missing (the plain block's head norm)"; return false; }
+        if (wn->kind != WeightKind::F32 || wn->elements != g.n_embd) {
+            err = "lm_head: output_norm.weight is engine form " + std::to_string((int) wn->kind) + " of " +
+                  std::to_string(wn->elements) + " elements; the plain head reads F32 x " + std::to_string(g.n_embd);
+            return false;
+        }
+        try {
+            plain_norm_rows(bb.R, (const float*) wn->data, bb.mixed, g.n_embd, (float) g.rms_eps, 1, stream);
+        } catch (const std::exception& e) { err = std::string("lm_head output_norm: ") + e.what(); return false; }
+        return true;
+    }
     const WeightRef* wn = tables.find("output_hc_norm.weight");
     const WeightRef* wd = tables.find("output_hc_down.weight");
     const WeightRef* wu = tables.find("output_hc_up.weight");
@@ -1167,7 +1186,115 @@ static void dump_half(const BlockBuffers& bb, const ModelGeometry& g, int64_t la
                       uint64_t off, uint64_t n, void* stream) {
     dump_slot(bb.dump, g, layer, src, off, n, stream);
 }
+// ================================ THE PLAIN BLOCK (hc = 1, Qwen3.6) ================================
+// See layer.hpp: the pre-norm residual block of `qwen35moe`, a second path chosen by `g.hc`, never the GR kernels
+// on one stream.  The verify window (verify.cpp) calls the same two row helpers over its T rows.
+void plain_norm_rows(const float* R, const float* w, float* mixed, int64_t n_embd, float eps, int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    // ggml's `rms_norm` (per row: x * rsqrt(mean(x^2) + eps)) then `mul` by the weight, in that order; one block per
+    // row with a fixed reduction order, so row t of n rows is bitwise the one-row call (native_qsa.cu).
+    strata::kernels::native_qsa_rms_norm_weighted(R, w, mixed, (int) n_embd, n_tok, eps, stream);
+}
+void plain_residual_rows(float* R, const float* block_out, int64_t n_embd, int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    strata::kernels::add_inplace(R, block_out, n_embd * n_tok, stream);   // elementwise: rows are independent
+}
+namespace {
+/// The F32 norm weight `suffix` of layer `v`, or null with `err` naming the tensor and the form found.  The plain
+/// block reads it as `const float*`, so the ENGINE FORM must be F32 (4 B/elem): the pack keeps Qwen3.6's norms as
+/// the F32 they are in the file.  A BF16 row (2 B/elem) read as f32 would walk 2x the tensor inside the arena and
+/// produce a finite wrong norm - the layout.cpp failure in a new coat - so the form is checked here as well.
+const float* plain_norm_weight(const LayerView& v, const char* suffix, int64_t n_embd, std::string& err) {
+    const WeightRef* w = v.get(suffix);
+    if (w == nullptr) { err = v.name(suffix) + " is missing (the plain block's norm; hc = 1)"; return nullptr; }
+    if (w->kind != WeightKind::F32 || w->elements != n_embd || w->data == nullptr) {
+        err = v.name(suffix) + " is engine form " + std::to_string((int) w->kind) + " of " +
+              std::to_string(w->elements) + " elements; the plain block reads F32 x " + std::to_string(n_embd);
+        return nullptr;
+    }
+    return (const float*) w->data;
+}
+/// `block_layer_pre` at hc = 1.  The stages and the `half` / `stage_prefix` selection are the GR path's (0 read,
+/// 1 mixer, 2 write, 3 read, 4 route), so `session_replay_stages` and the measurement splits apply unchanged.
+bool plain_block_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,
+                     const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb, const MoEBuffers& mb, int64_t k,
+                     const BlockBuffers& bb, void* stream, std::string& err, const Doorbell* db, const PleRun* ple,
+                     int half, int stage_prefix) {
+    if (ple != nullptr && ple->ready()) {
+        err = "block_layer_pre: the plain block (hc = 1) has no per-layer embedding, but a PLE run was supplied";
+        return false;
+    }
+    const LayerView v(tables, layer);
+    const float* w_attn = plain_norm_weight(v, "attn_norm.weight", g.n_embd, err);
+    if (w_attn == nullptr) return false;
+    const float* w_post = plain_norm_weight(v, "post_attention_norm.weight", g.n_embd, err);
+    if (w_post == nullptr) return false;
+    const float eps = (float) g.rms_eps;
+    const bool qsa = is_qsa_layer(g, layer);
+    const bool run0 = stage_prefix > 0 ? (stage_prefix >= 1) : (half == 0 || half == 1);
+    const bool run1 = stage_prefix > 0 ? (stage_prefix >= 2) : (half == 0 || half == 1);
+    const bool run2 = stage_prefix > 0 ? (stage_prefix >= 3) : (half == 0 || half == 1);
+    const bool run3 = stage_prefix > 0 ? (stage_prefix >= 4) : (half == 0 || half == 2);
+    const bool run4 = stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);
+    try {
+        if (run0) {   // x = rms_norm(R) * attn_norm   (the oracle's `attn_norm-N`)
+            st_begin(layer, 0, stream);
+            plain_norm_rows(bb.R, w_attn, bb.mixed, g.n_embd, eps, 1, stream);
+            st_end(layer, 0, stream);
+        }
+    } catch (const std::exception& e) { err = v.name("attn_norm") + ": " + e.what(); return false; }
+    if (run1) {   // the mixer: whatever `qsa_layer` / `gdn_layer` produce for this geometry (their own branches)
+        st_begin(layer, 1, stream);
+        if (qsa) {
+            if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err, bb.dump))
+                return false;
+        } else if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;
+        st_end(layer, 1, stream);
+        dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);
+    }
+    try {
+        if (run2) {   // R += out   (`attn_residual-N`): applied here, no pending write
+            st_begin(layer, 2, stream);
+            plain_residual_rows(bb.R, bb.block_out, g.n_embd, 1, stream);
+            st_end(layer, 2, stream);
+        }
+        if (run3) {   // x = rms_norm(R) * post_attention_norm   (`attn_post_norm-N`)
+            st_begin(layer, 3, stream);
+            plain_norm_rows(bb.R, w_post, bb.mixed, g.n_embd, eps, 1, stream);
+            st_end(layer, 3, stream);
+        }
+    } catch (const std::exception& e) { err = v.name("post_attention_norm") + ": " + e.what(); return false; }
+    if (run4) {   // the router (rings the doorbell), then the shared expert while the host runs the pool
+        st_begin(layer, 4, stream);
+        const bool ok = moe_route(tables, g, layer, k, mb, bb.mixed, stream, err, db);
+        st_end(layer, 4, stream);
+        if (!ok) return false;
+        if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+    }
+    return true;
+}
+/// `block_layer_post` at hc = 1: combine, then `R += out` (`l_out-N`), then a control vector if one covers the layer.
+bool plain_block_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& mb,
+                      const BlockBuffers& bb, const float* parts, void* stream, std::string& err) {
+    st_begin(layer, 5, stream);
+    if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
+                       : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
+    st_end(layer, 5, stream);
+    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);
+    st_begin(layer, 6, stream);
+    try {
+        plain_residual_rows(bb.R, bb.block_out, g.n_embd, 1, stream);
+        if (strata::kernels::cvec().covers(layer))
+            strata::kernels::cvec_apply(bb.R, layer, 1, g.n_embd, nullptr, 0, nullptr, 0, false, stream);
+    } catch (const std::exception& e) { err = std::string("block_layer_post: ") + e.what(); return false; }
+    st_end(layer, 6, stream);
+    return true;
+}
+}  // namespace
 bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,                     int32_t pos_base, const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb,                     const MoEBuffers& mb, int64_t k, const BlockBuffers& bb, void* stream, std::string& err,                     const Doorbell* db, const PleRun* ple, int half, int stage_prefix) {
+    if (g.hc == 1)   // Qwen3.6: the plain pre-norm block, not the hyper-connection read on one stream
+        return plain_block_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple, half,
+                               stage_prefix);
     // ================================ THE PLE, AT LAYER 1 ONLY ================================
     //
     // **THIS IS THE CALL WHOSE ABSENCE FAILED GATE C1.**  Layer 1 carries the six `blk.1.ple_*` tensors and no
@@ -1316,7 +1443,9 @@ uint64_t ple_run_scratch_bytes() {
     return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {
+    if (g.hc == 1) return plain_block_post(tables, g, layer, k, mb, bb, parts, stream, err);
+    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
