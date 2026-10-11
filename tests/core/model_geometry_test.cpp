@@ -62,6 +62,7 @@ void toy(const fs::path& dir) {
     if (!ok) return;
     check(g.arch == ModelArch::Qwen35Moe, "arch qwen35moe");
     check(g.n_embd == 64, "n_embd 64 (embedding_length)");
+    check(g.n_vocab == 128, "n_vocab 128 (output.weight / token_embd.weight rows, the 128 tokens)");
     check(g.n_layers == 4 && g.nextn_layers == 1, "n_layers 4 = block_count 5 - nextn_predict_layers 1");
     check(g.qsa_interval == 4 && g.n_qsa_layers() == 1 && g.n_gdn_layers() == 3,
           "full_attention_interval 4: layers 0,1,2 GDN, layer 3 attention");
@@ -172,6 +173,24 @@ void qwen4exp() {
     check(guard.find("'llama'") != std::string::npos, "guard: 'llama' refused by name: " + guard);
     check(!read(q.string(), g, err) && err.find("'llama'") != std::string::npos, "reader: 'llama' refused by name");
 
+    // the vocabulary is read from the tensors; two statements of it that disagree are refused naming both
+    const fs::path vq = d.path / "vocab.gguf";
+    fixture::write(vq, {fixture::str("general.architecture", "qwen4exp"), fixture::u32("qwen4exp.block_count", 48),
+                        fixture::u32("qwen4exp.embedding_length", 2560), fixture::u32("qwen4exp.expert_count", 512),
+                        fixture::u32("qwen4exp.expert_used_count", 10), fixture::u32("qwen4exp.attention.head_count", 24),
+                        fixture::u32("qwen4exp.attention.head_count_kv", 2)},
+                   {fixture::Tensor{"output.weight", {64, 100}, 0, 1}, fixture::Tensor{"token_embd.weight", {64, 128}, 0, 2}});
+    ModelGeometry gv;
+    check(!read(vq.string(), gv, err) && err.find("output.weight says 100 tokens but token_embd.weight says 128") != std::string::npos,
+          "output.weight 100 rows against token_embd.weight 128: refused naming both: " + err.substr(0, 70));
+    const fs::path vo = d.path / "vocab-ok.gguf";
+    fixture::write(vo, {fixture::str("general.architecture", "qwen4exp"), fixture::u32("qwen4exp.block_count", 48),
+                        fixture::u32("qwen4exp.embedding_length", 2560), fixture::u32("qwen4exp.expert_count", 512),
+                        fixture::u32("qwen4exp.expert_used_count", 10), fixture::u32("qwen4exp.attention.head_count", 24),
+                        fixture::u32("qwen4exp.attention.head_count_kv", 2)},
+                   {fixture::Tensor{"output.weight", {64, 100}, 0, 1}});
+    check(read(vo.string(), gv, err) && gv.n_vocab == 100, "output.weight alone sets n_vocab 100");
+
     // a qwen35moe file with a key llama.cpp's loader requires missing: the guard names it
     const fs::path r = d.path / "short.gguf";
     fixture::write(r, {fixture::str("general.architecture", "qwen35moe"), fixture::u32("qwen35moe.block_count", 40)}, {});
@@ -228,6 +247,7 @@ int real(const std::string& path) {
               "256 experts x top-8, ff 512, shared ff 512");
         check(g.hc == 1 && !g.has_ple && !g.has_indexer(), "plain residual, no PLE, no indexer");
         check(std::fabs(g.rms_eps - 1e-6) < 1e-9, "rms eps 1e-6");
+        check(g.n_vocab == 248320, "n_vocab 248320 (output.weight's rows, the tokenizer's list)");
     }
     if (g.arch == ModelArch::Qwen35Moe) std::printf("  gate: %s\n", strata::core::qwen35moe_not_yet(g).c_str());
     return g_fail ? 1 : 0;

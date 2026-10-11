@@ -141,6 +141,29 @@ inline bool read_model_geometry(const strata::GgufFile& meta, ModelGeometry& g, 
                    std::to_string(g.head_dim));
     if (g.rope_sections[0] + g.rope_sections[1] + g.rope_sections[2] + g.rope_sections[3] != g.n_rot / 2)
         return bad("rope.dimension_sections do not sum to rope.dimension_count / 2 = " + std::to_string(g.n_rot / 2));
+    // the vocabulary: `output.weight`'s rows are what the engine samples over (generate.cpp takes n_vocab from that
+    // tensor), `token_embd.weight`'s rows are what the native embedding loads with g.n_vocab, and the tokenizer's
+    // token list is the third statement of the same number.  Whichever of the three the metadata shard carries must
+    // agree; the default (248,320, the shipped files') stands only when none is present (a metadata-only fixture).
+    {
+        int64_t seen[3] = {-1, -1, -1};
+        const char* names[3] = {"output.weight", "token_embd.weight", "tokenizer.ggml.tokens"};
+        if (const strata::TensorInfo* t = meta.find(names[0])) seen[0] = t->shape.size() >= 2 ? (int64_t) t->shape[1] : 0;
+        if (const strata::TensorInfo* t = meta.find(names[1])) seen[1] = t->shape.size() >= 2 ? (int64_t) t->shape[1] : 0;
+        if (const strata::MetaValue* v = meta.get(names[2]))
+            seen[2] = v->type == strata::MetaType::ARRAY ? (int64_t) v->count : 0;   // `count` is the full length; `items` is capped
+        int64_t vocab = -1;
+        const char* from = nullptr;
+        for (int i = 0; i < 3; ++i) {
+            if (seen[i] < 0) continue;
+            if (seen[i] <= 0) return bad(std::string(names[i]) + " gives no vocabulary size");
+            if (vocab < 0) { vocab = seen[i]; from = names[i]; continue; }
+            if (seen[i] != vocab)
+                return bad(std::string(from) + " says " + std::to_string(vocab) + " tokens but " + names[i] + " says " +
+                           std::to_string(seen[i]));
+        }
+        if (vocab > 0) g.n_vocab = vocab;
+    }
     return true;
 }
 
@@ -187,6 +210,7 @@ inline std::string model_geometry_text(const ModelGeometry& g) {
     auto add = [&](const char* k, int64_t v) { s += std::string("  ") + k + " " + std::to_string(v) + "\n"; };
     s += std::string("  arch ") + model_arch_name(g.arch) + "\n";
     add("n_embd", g.n_embd);
+    add("n_vocab", g.n_vocab);
     add("n_layers", g.n_layers);
     add("nextn_layers", g.nextn_layers);
     add("qsa_interval", g.qsa_interval);
