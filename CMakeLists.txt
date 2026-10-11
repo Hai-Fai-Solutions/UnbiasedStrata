@@ -736,6 +736,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME prefill_qwen36_attn_test COMMAND prefill_qwen36_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_prefill full4)
       set_tests_properties(prefill_qwen36_attn_test PROPERTIES FIXTURES_REQUIRED qwen36_prefill_data SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
+    # Qwen3.6 step 4: the drafter (the -MTP file's nextn block through core/mtp.cpp, its experts on the native kernels)
+    # against the oracle's --mtp dumps, position by position, with the prompt-side pass (docs/qwen36-port/step4-drafter.md).
+    # The fixture (tests/python/qwen36_mtp_fixture.py) is the prompt-path trunk plus the nextn block, and the draft
+    # pack tools/mtp_qwen36_pack.py cuts from it; `qwen36_mtp_test --real ...` is the real-file arm (by hand).
+    add_executable(qwen36_mtp_test tests/cuda/qwen36_mtp_test.cpp)
+    target_link_libraries(qwen36_mtp_test PRIVATE strata_prefill strata_engine strata_artifact ${_strata_gpu_runtime_target})
+    if(NOT _iq_python STREQUAL "")
+      add_test(NAME qwen36_mtp_fixtures
+               COMMAND ${_iq_python} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen36_mtp_fixture.py
+                       --out ${CMAKE_CURRENT_BINARY_DIR}/qwen36_mtp)
+      set_tests_properties(qwen36_mtp_fixtures PROPERTIES FIXTURES_SETUP qwen36_mtp_data SKIP_RETURN_CODE 3
+                           TIMEOUT 1800 ENVIRONMENT "STRATA_GGUF_PY=${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/gguf-py")
+      add_test(NAME qwen36_mtp_test COMMAND qwen36_mtp_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_mtp)
+      set_tests_properties(qwen36_mtp_test PROPERTIES FIXTURES_REQUIRED qwen36_mtp_data SKIP_RETURN_CODE 77 TIMEOUT 900)
+    endif()
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
