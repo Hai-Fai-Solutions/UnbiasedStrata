@@ -150,8 +150,21 @@ RMS against an FP32 reference over random weights; the oracle's own real-file nu
 
 ### 3.2 VM 211, GTX 1080 Ti (sm_61), 2026-10-11
 
-(filled in below once the card is free: `gdn_rec_parity`, `prefill_qwen36_test` on both fixtures, the fused tests'
-exit 77, and which prompt-MoE path runs there.)
+Not run: the card's lock was held for the whole 30-minute wait the rules allow (by `qwen36-step3-gdn`, then
+`qwen36-step3-attn`, then `qwen36-step3-experts`, with a `llama-server` alive the whole time).  Everything is staged
+for it: the tree at `/home/rk/qwen36-step3-prefill/`, the fixtures and the oracle's dumps at
+`/home/rk/qwen36-step3-prefill-fx/` (copied from VM 221, not regenerated), and `/home/rk/run211-prefill.sh`, which
+configures at sm_61 with `STRATA_EXPERIMENTAL_SM60=ON`, builds the five test targets, runs `gdn_rec_parity`,
+`gemm_bf16_parity`, the two fused tests (expected exit 77), `prefill_qwen36_test` on `gdn3` and `full4` (with
+`STRATA_PREFILL_TIMING=1`, so the log says whether the prompt MoE took MMQ or the FP16 path) and `gdn3` again under
+`STRATA_PREFILL_MMQ=0`, logs to `/home/rk/logs/qwen36-step3-prefill-211.log`, and removes the lock.  To run it once
+the lock is free:
+
+    ssh rk@192.168.50.43 'set -o noclobber; [ -z "$(pgrep -x llama-server)" ] && [ -z "$(pgrep -f sweep_ladder_1080ti.py)" ] \
+        && echo qwen36-step3-prefill > /home/rk/VM-BUSY && (nohup /home/rk/run211-prefill.sh > /dev/null 2>&1 &)'
+    # then: until ssh rk@192.168.50.43 test -f /home/rk/logs/qwen36-step3-prefill-211.DONE; do sleep 30; done
+
+The numbers go here when it has run.
 
 ## 4. Git
 
