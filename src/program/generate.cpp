@@ -2160,7 +2160,10 @@ int main(int argc, char** argv) {
     if (o.ram_cap_gib > 0.0) {
         const uint64_t cap = (uint64_t) (o.ram_cap_gib * 1073741824.0);
         strata::core::detail::set_host_ram_cap(cap);
-        if (o.resident_budget == 0 || o.resident_budget > cap) o.resident_budget = o.resident_cpu_experts ? cap : o.resident_budget;
+        // only an explicit --resident-budget-gib above the cap is clamped: setting a budget for the auto path would
+        // flip pin_cache_complement into explicit-budget mode (no lending, the file tier unbuffered, the budget
+        // warning on every run); the auto path is already bounded by the host_available_memory clamp above
+        if (o.resident_budget > cap) o.resident_budget = cap;
         std::fprintf(stderr, "strata generate: --ram-cap %.2f GiB: the RAM expert tier and the pinned arena are bounded "
                              "to it (the page cache is not: cap it with the machine or a cgroup)\n", o.ram_cap_gib);
     }
