@@ -1399,6 +1399,10 @@ bool Verifier::capture_commit(std::string& err) {
                                     beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, g.gdn_gate(),
                                     y_dummy_, (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_, (int) MT);
                 ++gdn_index;
+            } else if (!g.has_indexer()) {
+                // dense attention (Qwen3.6): no indexer key tail to restore; the K/V cells past the accepted prefix
+                // are overwritten when those positions are processed again (the header's STATE paragraph)
+                ++qsa_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
@@ -1953,6 +1957,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                         (int) g.ssm_k_heads, (int) HV, 1, keep, cs_);
                 }
                 ++gdn_index;
+            } else if (!g.has_indexer()) {
+                ++qsa_index;   // dense attention: no indexer tail (as in capture_commit)
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
