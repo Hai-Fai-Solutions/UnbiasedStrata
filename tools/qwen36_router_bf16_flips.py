@@ -16,8 +16,13 @@ F32 router weight, forms the logits three ways - F32 x F32 (llama.cpp and the or
 own `ffn_moe_logits-N`), F32 x BF16(W) (the engine's native MMVF contract) and BF16(x) x BF16(W) (the legacy
 `bf16_gemv` contract, both operands rounded) - and reports per layer: positions of the top-k that differ, experts
 in one top-k set and not the other, tokens with any difference, and the smallest logit gap across the top-k boundary
-(a flip needs the rounding error to exceed that gap).  BF16 rounding is round-to-nearest-even, the engine's
-`bf16_from_f32`.
+(a flip needs the rounding error to exceed that gap), and the share of the layer's F32 router weight that is
+already BF16-representable (low 16 bits zero).  BF16 rounding is round-to-nearest-even, the engine's `bf16_from_f32`.
+
+Measured 2026-10-11 on both shipped files (UD-IQ3_XXS and UD-Q4_K_XL): every element of ffn_gate_inp,
+ffn_gate_inp_shexp, ssm_alpha, ssm_beta and ssm_conv1d is BF16-exact (the checkpoint is BF16; the converter stored
+them as F32), so F32 x BF16(W) is bitwise F32 x F32 and the flip rate of the engine's native contract is zero by
+construction; the pack needs no --compat-bf16 for them.  attn_norm is not BF16-exact (17%) and is read as F32.
 """
 from __future__ import annotations
 
@@ -61,8 +66,8 @@ def main() -> int:
     K = a.k
     print(f"{a.gguf}: {n_layers} layers, top-{K}; router weight type "
           f"{g.info('blk.0.ffn_gate_inp.weight').type_name}; dump {dump}")
-    print(f"{'layer':>5} {'oracle':>8} | {'F32 x BF16(W)':^30} | {'BF16(x) x BF16(W)':^30} | {'min gap':>9}")
-    print(f"{'':>5} {'max|d|':>8} | {'slots':>6} {'set':>6} {'tokens':>7} {'rate':>7} | {'slots':>6} {'set':>6} {'tokens':>7} {'rate':>7} | {'(logits)':>9}")
+    print(f"{'layer':>5} {'oracle':>8} {'W bf16':>7} | {'F32 x BF16(W)':^30} | {'BF16(x) x BF16(W)':^30} | {'min gap':>9}")
+    print(f"{'':>5} {'max|d|':>8} {'-exact':>7} | {'slots':>6} {'set':>6} {'tokens':>7} {'rate':>7} | {'slots':>6} {'set':>6} {'tokens':>7} {'rate':>7} | {'(logits)':>9}")
     tot = {"w": [0, 0, 0], "xw": [0, 0, 0], "slots": 0, "tokens": 0}
     worst_oracle = 0.0
     for il in range(n_layers):
@@ -74,11 +79,12 @@ def main() -> int:
         l32 = (x @ w.T).astype(F32)
         worst_oracle = max(worst_oracle, float(np.abs(l32 - ref).max()))
         wb = bf16_round(w)
+        exact = float((wb == w).mean())                   # the share of the weight the rounding leaves untouched
         l_w = (x @ wb.T).astype(F32)                      # the native MMVF contract: F32 activation, BF16 weight
         l_xw = (bf16_round(x) @ wb.T).astype(F32)         # the legacy bf16_gemv contract: both rounded
         t32 = topk_desc(ref, K)                           # the oracle's own selection (identical to llama.cpp's)
         gap = float((np.sort(ref, axis=1)[:, ::-1][:, K - 1] - np.sort(ref, axis=1)[:, ::-1][:, K]).min())
-        row = [f"{il:>5} {np.abs(l32 - ref).max():>8.1e} |"]
+        row = [f"{il:>5} {np.abs(l32 - ref).max():>8.1e} {exact:>7.4f} |"]
         for key, lg in (("w", l_w), ("xw", l_xw)):
             tk = topk_desc(lg, K)
             slots = int((tk != t32).sum())
@@ -90,13 +96,14 @@ def main() -> int:
         row.append(f" {gap:>9.2e}")
         print("".join(row))
     n = tot["slots"]
-    print(f"\n{'total':>5} {worst_oracle:>8.1e} |", end="")
+    print(f"\n{'total':>5} {worst_oracle:>8.1e} {'':>7} |", end="")
     for key in ("w", "xw"):
         s, st, tk = tot[key]
         print(f" {s:>6} {st:>6} {tk:>7} {st / n:>7.4f} |", end="")
     print(f"\n  slots = positions of the top-{K} that differ (order included); set = experts chosen by F32 and not by the "
           f"rounded weight (order ignored); tokens = tokens whose top-{K} SET differs; rate = set / ({tot['tokens']} tokens x {K}).")
-    print("  'oracle max|d|' is this script's F32 logits against the oracle's ffn_moe_logits-N (a check of the inputs, not a result).")
+    print("  'oracle max|d|' is this script's F32 logits against the oracle's ffn_moe_logits-N (a check of the inputs, not a result);")
+    print("  'W bf16-exact' is the share of the layer's F32 router weight whose low 16 bits are zero (1.0000: BF16(W) == W, F32 x BF16(W) is F32 x F32).")
     return 0
 
 
