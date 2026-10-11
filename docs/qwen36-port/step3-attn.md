@@ -144,22 +144,22 @@ about 10 ms of a token on this card.
 
 | cells | 24/2 fp16 before -> after | 24/2 INT8 | 24/2 Q4_0 | 16/2 fp16 | 16/2 INT8 | 16/2 Q4_0 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2,051 | 41.0 -> 42.0 | 38.9 -> 38.9 | 41.0 -> 40.8 | 43.0 | 33.8 | 34.8 |
-| 8,192 | 142.3 -> 142.3 | 141.0 -> 144.3 | 145.4 -> 163.8 | 140.4 | 121.9 | 135.2 |
-| 32,768 | 492.5 -> 418.8 | 496.6 -> 407.6 | 503.8 -> 464.9 | 378.9 | 330.8 | 373.8 |
+| 2,051 | 41.0-42.0 -> 41.0-41.9 | 38.9 -> 38.9-39.9 | 41.0-42.0 -> 41.0 | 43.0 | 33.8 | 34.8 |
+| 8,192 | 141.3-142.3 -> 140.3-141.3 | 141.3 -> 140.3-141.3 | 146.4-147.5 -> 143.4-144.4 | 140.4 | 121.9 | 135.2 |
+| 32,768 | 493.6-494.6 -> 494.4-494.6 | 496.6 -> 496.6-497.4 | 505.9-506.9 -> 497.6-497.7 | 378.9 | 330.8 | 373.8 |
 | 131,072 | | | | 1,290 | 1,126 | 1,287 |
 | 262,144 | | | | 2,354 | 2,117 | 2,605 |
 
-The before / after pairs are interleaved A/B runs (three rounds; rounds 2 and 3 agree to 1 us, round 1 is the
-warm-up); 2,051 is the single-chunk kernel on both sides (42.0 vs 41.0-41.7 fp16 across rounds, 38.9 vs 38.9
-INT8, 40.8 / 39.9 vs 41.0 Q4_0: equal within the run-to-run spread). 8,192 and above are the looped kernel
-against the old one: faster at 32,768 (the bounded grid), and at 8,192 fp16 / INT8 equal while **Q4_0 is 13%
-slower (164 vs 145 us)** - the looped kernel's extra registers cost the Q4_0 value loop a block per SM on Pascal.
-The dense model's states always take the looped kernel there (cap >= 131,072), so Qwen3.6 at `--kv q4_0` on the
-1080 Ti pays that 10-15% on the attention kernel at short depths (135 us against an estimated 120 at 8K, 16
-heads): 0.15 ms of a token, which is not a number the A2 floor can see; at long depths it is ahead. Not pursued
-further here; the register growth is in the sub-chunk loop's live state and the tried `__launch_bounds__(THREADS,
-4)` cap spilled and made every format slower (44.0 / 44.0 / 47.1 us at 2,051).
+The before / after pairs are interleaved A/B runs (rounds 2 and 3 of three; round 1 is the warm-up). The 24/2
+shape is sparse, so after e7c9c8d both sides are the same grid (one block per 64 cells at every capacity, the
+same 12.09 MiB scratch at 32,768) and the same single-chunk kernel body: the pairs agree within the 1 us
+run-to-run spread at every capacity and format, which is the drafter's case (its ring at 32,768) as much as the
+QSA layers' (2,051). The 16/2 columns are the dense model's states (cap >= 131,072 in practice), which take the
+looped kernel on Pascal: on Q4_0 it is 10-15% slower than the single-chunk body would be at short depths (the
+looped body's extra registers cost the Q4_0 value loop a block per SM; a `__launch_bounds__(THREADS, 4)` cap
+spilled and made every format slower, 44.0 / 44.0 / 47.1 us at 2,051 in that build), about 0.15 ms of a token
+at 8K depth, which the A2 floor cannot see; at long depths it is ahead of the unbounded grid (465 vs 504 us at
+32,768 in the 24/2 trial that measured the looped kernel on a sparse shape).
 
 At 262,144 cells, 16 heads, one row is 2.1 ms INT8 / 2.4 ms fp16 / 2.6 ms Q4_0 on the 1080 Ti: 21-26 ms of a
 token for the ten attention layers at the full context (the fp16 pool streams at 228 GB/s of the card's 484;
