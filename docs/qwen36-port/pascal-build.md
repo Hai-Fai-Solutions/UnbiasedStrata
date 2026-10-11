@@ -68,6 +68,23 @@ fixed on the branch; the final run (`logs/ctest-final.log`) is **69 passed, 4 fa
 | `expert_multi_test` | FAIL | `strata: this CPU cannot run the expert kernel: missing AVX512F AVX512BW AVX512VL AVX512-VNNI AVX512-VBMI.` | no: the canonical Q2_0 CPU expert kernel needs AVX-512; the Ryzen 7 1700 has AVX2 only (`STRATA_PORTABLE=ON`). Qwen3.6 rides the native pack path, which does not use this kernel |
 | `prefill_fused_moe_test`, `prefill_fused_iq_test` | Skipped (exit 77) | | expected: the fused prompt MoE needs sm_80 (`CMakeLists.txt`, SKIP_RETURN_CODE 77) |
 
+**`expert_multi_test` and AVX-512, on both VMs.** VM 211's Ryzen 7 1700 (Zen 1) and VM 221's i9-9900K (Coffee Lake)
+both lack AVX-512, so `expert_multi_test` refuses on both with `this CPU cannot run the expert kernel`. The kernel it
+tests is the canonical Q2_0 pack's CPU expert kernel (`src/kernels/cpu/expert.cpp`, `s2_expert_vnni_q`: AVX-512 VNNI
+and VBMI, with a scalar fallback for tests only), which bakes Flash-Next's 2560 x 640. The engine calls
+`cpu_require_expert_support()` only when the pack is NOT native (`generate.cpp`, "the canonical Q2_0 pack's CPU
+kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well"); for a native pack it logs instead that the
+expert kernels run on AVX-2 (or ggml-cpu `vec_dot` without AVX2 / with `STRATA_NO_IQ256`). What that means for
+step 5's RAM tier: the RAM tier (`FileExpertSource`'s pinned "cache complement", filled by profile rank) is read in
+two ways, both from the same bytes. The CPU lane computes experts from it: `ExpertPool`'s native modes 5 and 6
+(`src/kernels/cpu/pool.cpp`, `native_gu_rows` / `native_down_rows`, the AVX-2 i-quant kernels or ggml-cpu's
+`vec_dot`) take the blob pointer the source hands them, which is the complement's copy when the expert is held there
+and the mapped GGUF otherwise. And the VRAM staging path copies from it: `FileExpertSource::copy_blob` memcpys the
+complement's blob into the stage buffer bound for a VRAM slot (`prefetch` skips experts the complement holds; the
+`RAM-copy reads` counter of STATS). So the RAM tier is both a compute tier (the CPU lane, on AVX-2 for Qwen3.6
+on these hosts) and the source of VRAM refills; neither path touches the AVX-512 kernel, and the engine's own
+start-up refusal on these CPUs applies to the canonical pack only.
+
 Everything else passed, including every kernel parity on the card: `iq_parity`, `iq_multi_parity`, `mmvq_multi_parity`,
 `s2_gemv_*`, `s_gemv_*`, `dequant_s2_parity`, `gdn_parity`, `gdn_rec_parity`, `gr_parity`, `qsa_parity`,
 `qsa_topk_parity`, `qsa_topk_active_parity`, `decode_cluster_parity`, `sampler_parity` (all three), `rope_parity`,
@@ -85,7 +102,21 @@ and copied to `/home/rk/packs/qwen36-iq3/` (2,669 B). The Q4_K_XL layout was mad
 (`PYTHONPATH=third_party/llama.cpp/gguf-py`, 0.6 s, 2,727 B, `/home/rk/packs/qwen36-q4/`), byte-identical in its
 layer lines to `tests/data/native_experts/qwen36-q4_k_xl.txt`.
 
-The gate, exactly the notes' command on the IQ3_XXS file (`logs/gate.log`), exit 1 after 0.13 s:
+**The first run did not reach the gate.** With the tree at `8b7525e` both files printed the geometry block and then
+exit 1 in 0.13 s from the expert format whitelist that `generate.cpp` ran right after the layout load:
+
+    strata generate: layer 0's experts are IQ2_S/IQ3_XXS (ggml types 22/18), which this engine has no GPU kernels for
+
+(`Q4_K/Q5_K (ggml types 12/13)` for the Q4 file). `native_expert_supported()`'s *down* types (`STRATA_D_FMTS` in
+`src/kernels/cuda/iq_kernels.cu`) are IQ4_NL, IQ4_XS, Q5_0, Q5_1, Q8_0 and type 42; Q4_K / Q5_K / IQ2_S / IQ3_XXS
+are gate/up types only and Q6_K is in neither (`native_expert_parity_refuses_q6_K` pins that). The IQ3_XXS file's
+down projections are IQ3_XXS on 37 layers (IQ4_XS on 34/38/39, which the kernels have); the Q4_K_XL's are Q5_K on
+37 and Q6_K on 34/38/39. The study's section 3.7 checked the layout against these types, not the kernels. The down
+kernels are step 3's `qwen36-step3-experts` branch; commit `30e3add` moved the gate ahead of the whitelist, so a
+Qwen3.6 file now prints the plan and the missing pairs. The whitelist still runs, unchanged, for every other file.
+
+**The gate as it stands** (`30e3add` and after, `logs/gate-IQ3_XXS-cap0.log`): exit 2 after 0.36 s, the IQ3_XXS
+file with its layout pack, the notes' command:
 
     strata generate: model geometry (/home/rk/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf, from the file's metadata):
       arch qwen35moe
@@ -118,28 +149,45 @@ The gate, exactly the notes' command on the IQ3_XXS file (`logs/gate.log`), exit
       n_ff_shexp 512
       has_ple no
       has_indexer no
-    strata generate: layer 0's experts are IQ2_S/IQ3_XXS (ggml types 22/18), which this engine has no GPU kernels for
+    strata generate: VRAM plan for /home/rk/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf on this card (kv q4_0, prefill borrows cache slots):
+      VRAM budget 11001 MiB
+      fixed set at 262144 tokens: 4019 MiB = weights 1596 + drafter 520 + KV 1440 + session 162 + CUDA context 0 + reserve 300 (prefill borrows cache slots)
+      expert slots in VRAM: 6748 of 10240 (65%) at 6981 MiB, 1084825 B mean blob
+      expert copies in RAM: 3492 (3612 MiB of 9409 MiB available minus 4096 headroom)
+      experts mapped from the model file: 0
+    strata generate: step 3 also needs GPU expert kernels for gate-up/down IQ2_S/IQ3_XXS (37 layers: 0, 1, 2, 3, 4, 5, 6, 7, ... (37 layers))
+    strata generate: this is a Qwen3.6-35B-A3B file (qwen35moe, 40 layers, 2048 wide, 256 experts x top-8): Phase 2 step 2 (geometry, metadata, the VRAM plan above) is done, but the engine cannot run it yet.  Not done: step 3 (kernels and the block: the GDN gate SiLU(z) instead of sigmoid(z), dense attention at 16 heads with no indexer, the block and the verify window without hyper-connections, prefill at this geometry), step 4 (the native pack and the MTP drafter from blk.40, the expert profile at 40 x 256).  See docs/PLAN-qwen36-35b-a3b.md section 5 and docs/qwen36-port/step2-notes.md
 
-The Q4_K_XL file with its layout pack (`logs/gate-q4.log`): the same geometry block (nextn_layers 1), then
+The Q4_K_XL file (`logs/gate-Q4_K_XL-cap0.log`, exit 2): the same geometry block with `nextn_layers 1`, then
 
-    strata generate: layer 0's experts are Q4_K/Q5_K (ggml types 12/13), which this engine has no GPU kernels for
+    strata generate: VRAM plan for /home/rk/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf on this card (kv q4_0, prefill borrows cache slots):
+      VRAM budget 11001 MiB
+      fixed set at 262144 tokens: 4461 MiB = weights 2038 + drafter 520 + KV 1440 + session 162 + CUDA context 0 + reserve 300 (prefill borrows cache slots)
+      expert slots in VRAM: 3575 of 10240 (34%) at 6539 MiB, 1917542 B mean blob
+      expert copies in RAM: 2929 (5356 MiB of 9453 MiB available minus 4096 headroom)
+      experts mapped from the model file: 3736 (read from disk on a miss)
+    strata generate: step 3 also needs GPU expert kernels for gate-up/down Q4_K/Q5_K (37 layers: 0, 1, 2, 3, 4, 5, 6, 7, ... (37 layers))
+    strata generate: step 3 also needs GPU expert kernels for gate-up/down Q4_K/Q6_K (2 layers: 34, 38)
+    strata generate: step 3 also needs GPU expert kernels for gate-up/down Q5_K/Q6_K (1 layers: 39)
+    strata generate: this is a Qwen3.6-35B-A3B file (qwen35moe, ...): [the same gate message]
 
-**So the step 2 gate message (`qwen35moe_not_yet`, printed after the VRAM plan) is not reached by either real file.**
-The refusal is loud, specific and not a crash, but it is an earlier one: `generate.cpp` checks
-`native_expert_supported()` for every layer right after `expert_layout_load`, before the plan and the gate, and that
-whitelist's *down* types (`STRATA_D_FMTS` in `src/kernels/cuda/iq_kernels.cu`) are IQ4_NL, IQ4_XS, Q5_0, Q5_1,
-Q8_0 and type 42 only; Q4_K / Q5_K / IQ2_S / IQ3_XXS are gate/up types (`STRATA_GU_FMTS`) and Q6_K is in neither
-(`native_expert_parity_refuses_q6_K` pins that). The IQ3_XXS file's down projections are IQ3_XXS on 37 layers and
-IQ4_XS on 34/38/39; the Q4_K_XL's are Q5_K on 37 and Q6_K on 34/38/39. The plan's step 3 line "Unsloth's
-Q4_K/Q5_K types already included" holds for gate/up only. The findings for the next steps:
+(CUDA reports the card as 11,165 MiB total with 11,001 free at start, 164 MiB in use by the display and the
+driver; `nvidia-smi`'s 11,264 is the marketing figure.)
 
-1. the grouped *down* kernel needs IQ3_XXS (the default file) and Q5_K / Q6_K (the Q4 file), or step 4's pack
-   requantizes the down projections to a type the kernel has (Q8_0 / Q5_1, as the Flash-Next packs do) and the
-   census' 10.6 / 18.7 GB expert totals move with it;
-2. the step 2 gate is demonstrable on a real file only once the whitelist passes (or the plan+gate block is moved
-   ahead of it); the message itself is exercised by `model_geometry_test --real` on both files on the VM, which
-   prints it in full.
+**`--vram-cap` on the 1080 Ti** (`logs/gate-*-cap*.log`, after commit `2b4fcf1`): the cap line and the plan at
+the study's caps that fit on an 11 GB card. "Free to this engine" is cap minus the 164 MiB in use before the
+start, within the driver's 1 MiB rounding of the blocker, at every cap; the start would refuse if it were more than
+64 MiB off.
 
+| `--vram-cap` (MiB) | held back | free to this engine | expected (cap - 164) |
+| ---: | ---: | ---: | ---: |
+| 5722 (6 GB) | 5443 | 5557 | 5557 |
+| 7629 (8 GB) | 3536 | 7463 | 7464 |
+| 8192 | 2973 | 8027 | 8027 |
+| 10490 (11 GB decimal) | 675 | 10325 | 10325 |
+| 12288 | "is not below this card's 11165 MiB: no cap" | 11001 | |
+
+The plan's tiers at each cap are in `step2-notes.md` section 5, next to the study's table 4.3.
 ## 5. The Makefile's Pascal switch
 
 `make build CUDA_ARCHS=61 BUILD_DIR=build-make` on the VM, with no compiler override at all (`logs/make-plain.log`):

@@ -93,7 +93,9 @@ mode passes on both files; `vram_plan_test` 43 checks pass; `test_iq_pack.py` 23
 
 On VM 211 (the 1080 Ti, sm_61; `docs/qwen36-port/pascal-build.md` has the build's outcome):
 
-    rsync -a --delete --exclude build-mac --exclude .git /Users/robertkarl/Code/UnbiasedStrata-step2/ rk@192.168.50.43:/home/rk/UnbiasedStrata-step2/
+    rsync -a --delete --exclude build-mac --exclude .git --exclude build --exclude build-make --exclude logs \
+          /Users/robertkarl/Code/UnbiasedStrata-step2/ rk@192.168.50.43:/home/rk/UnbiasedStrata-step2/
+    # (--delete without the three VM-side excludes removed the VM's build/, build-make/ and logs/ once)
     cmake -S . -B build -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=ON \
           -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=61 -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
           -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13
@@ -120,3 +122,45 @@ every log line; the VM keeps the tree at `/home/rk/UnbiasedStrata-step2/` with `
 
 Correction to section 3's table: the Q4_K_XL expert total is 19,635,634,176 B (the pack header's figure, and the sum
 of its blobs); the earlier 19,636,158,464 was 524,288 B high and was also in `expert_layout_test`.
+
+### The planner on the 1080 Ti against the study's table 4.3 (2026-10-11, after `4a998ad`)
+
+The engine's own plan (`--vram-cap`, prefill borrowing, `logs/gate-*-cap*.log` on the VM) at the caps an 11 GB card
+can emulate; the study's "derived, borrow" column beside each. The engine's figures run a few percent above the
+study's because the study's budgets carry a 300 MiB CUDA-context term that the engine's free figure already lacks,
+less the 164 MiB this VM's display and driver hold. The 12, 16, 24 and 32 GB rungs cannot be emulated on this card
+(`--vram-cap 12288` is "not below this card's 11165 MiB: no cap"); `vram_plan_test` covers them from the study's
+inputs.
+
+| Budget | cap (MiB) | VRAM budget | Q4 slots (study) | Q4 RAM copies / mapped | IQ3 slots (study) | IQ3 RAM copies / mapped |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6 GB | 5722 | 5557 | 598 (~525) | 2,894 / 6,748 | 1,486 (~1,350) | 5,172 / 3,582 |
+| 8 GB | 7629 | 7463 | 1,641 (~1,570) | 2,855 / 5,744 | 3,328 (~3,200) | 5,115 / 1,797 |
+| 8 GiB | 8192 | 8027 | 1,949 | 2,874 / 5,417 | 3,873 | 5,068 / 1,299 |
+| 11 GB (decimal) | 10490 | 10325 | 3,206 (~3,130) | 2,959 / 4,075 | 6,094 (~5,960) | 4,146 / 0 |
+| 1080 Ti, no cap | | 11001 | 3,575 (~3,550) | 2,929 / 3,736 | 6,748 (~6,700) | 3,492 / 0 |
+
+The RAM tier is sized from this VM's ~9.4 GiB available minus the 4 GiB headroom (the `--resident-experts` rule),
+so the Q4 file keeps a disk tier at every cap on this host and the IQ3 file none from 11 GB up, as 4.3 said.
+
+### What the review and the Pascal run changed afterwards (2026-10-11, the same branch)
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| the down-type whitelist, missed by the study's section 3.7 | `30e3add` | 3.7 said "the IQ3_XXS file's 37/3 down split and the Q4_K_XL's Q6_K layers need no format change" of the *layout*; it did not check `STRATA_D_FMTS`, the grouped kernels' down types (IQ4_NL, IQ4_XS, Q5_0, Q5_1, Q8_0), against the files' IQ3_XXS / Q5_K / Q6_K down projections. The gate now runs before that whitelist and names the missing pairs per layer; the kernels are step 3's `qwen36-step3-experts` branch |
+| `--vram-cap` subtracted the blocker twice | `2b4fcf1` | `vram_info` takes the blocker's own bytes out of `used`; the cap line prints what a card of the cap would show and refuses if the clamped figure is off by more than 64 MiB |
+| the planner's 300 MiB CUDA-context term on top of a free figure already net of it | `4a998ad` | the engine passes 0; the unit test keeps the study's 300 MiB with the cards' sizes as budgets |
+| `--ram-cap` set an explicit resident budget on the auto path | `76a437f` | only an explicit budget above the cap is clamped |
+| `/health`'s last reading raced | `84794ce` | its own mutex, copies under it |
+| the qwen4exp reader's optional keys untested | `afec2f1` | a fixture with the real Flash-Next key set equals the defaults field by field; the fixture writer gained f32 and u32-array values |
+| the trace bound literal 48; the refused-profile test | `db4da2f`, `d010040` | `Drive::n_layers` from the geometry; `expert_profile_save_test` sees a 48 x 512 profile refused for 40 x 256 |
+| `test_iq_pack.py` had no test of the step's additions | `b2ccff0` | `--layout-only`, the nextn exclusion, the fused refusal: 26 tests |
+| `tools/make_profile.py` `N_LAYER, N_EXPERT = 48, 512` | (step 4) | the profile from the E0 trace at 40 x 256 is step 4's, with the trace format |
+
+`model_geometry_test --real` on the Mac's `~/models/dwarfstar/Qwen3.8-Flash-Next-Q2.gguf` (147 GB, the only Flash-Next
+file on the Mac or VM 211; the `ple_parity` shard path does not exist anywhere): the qwen4exp reader reads it
+(48 trunk layers, `nextn_layers 1`, every other field the struct's default, separate tensor forms), but the
+architecture guard refuses it with `qwen4exp.block_count = 49, expected 48`: the guard's qwen4exp branch wants the
+literal 48 (unchanged by this step, the reviewer's byte-for-byte check), and this file is an MTP build with a draft
+block. Whether that file ever ran under this engine is not this step's question; it is recorded here because the
+guard, not the reader, is what refuses it.
