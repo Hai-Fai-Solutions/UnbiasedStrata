@@ -1112,10 +1112,10 @@ if(STRATA_NATIVE_EXPERTS)
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
-    # follows eddoursul/Strata 7706c1b)
+    # follows eddoursul/Strata 7706c1b), plus q6_k (Qwen3.6-35B-A3B UD-Q4_K_XL's layers 34, 38, 39)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
-      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
+      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1 q6_k)
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)

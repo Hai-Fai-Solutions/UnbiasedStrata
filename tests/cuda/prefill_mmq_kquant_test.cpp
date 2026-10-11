@@ -3,7 +3,8 @@
 // reference quantizers, against a double-precision product of ggml's dequantized weights.  MMQ rounds the activations
 // to q8_1 by design, so this is a screen for layout, stride, expert-bound and row-id errors (the bounds of
 // tests/hip/prefill_mmq_parity.cpp), not a bit-exactness test.  Several experts per product, permuted rows, an
-// all-zero row; the formats the build does not cover (Q6_K) must say so.
+// all-zero row.  Qwen3.6-35B-A3B's UD-Q4_K_XL adds Q5_K and Q6_K down projections at its 2048 x 512; a format the
+// build does not cover (Q3_K) must say so.
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -142,7 +143,7 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
 int main() {
     try {
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
-        if (mmq::supported(GGML_TYPE_Q6_K)) throw std::runtime_error("Q6_K should not be covered");
+        if (mmq::supported(GGML_TYPE_Q3_K)) throw std::runtime_error("Q3_K should not be covered");
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         {
@@ -155,6 +156,8 @@ int main() {
                 product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
                 product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
                 product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
+                product(ctx, s, ("Q5_K down 2048x512" + tag).c_str(), GGML_TYPE_Q5_K, 2048, 512, counts, trial + 17);
+                product(ctx, s, ("Q6_K down 2048x512" + tag).c_str(), GGML_TYPE_Q6_K, 2048, 512, counts, trial + 21);
                 ++trial;
             }
         }
