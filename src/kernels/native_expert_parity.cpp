@@ -14,8 +14,10 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 // (e) the negative control: the high byte of one block's fp16 scale flipped (its sign) in one down row must move
-// that row's GPU output by more than 1e-2 relative and no other row by any bit; the same in one gate row must move
-// the output at all (more than 1e-4 relative over every row: one of n_ff SwiGLU terms changes).
+// that row's GPU output by more than 1e-2 relative for a 256-value block of a 512-wide row (Qwen3.6's down types),
+// the gate scaled by the block's share of the row for the others (a 32-value block of Flash-Next's 640: 1e-3; the
+// sign flip of one of 20 blocks measured 8e-3 to 1.4e-2), and no other row by any bit; the same in one gate row must
+// move the output at all (more than 1e-4 relative over every row: one of n_ff SwiGLU terms changes).
 // The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -350,13 +352,15 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             bad[(size_t) rg * f.gu_row + scale_byte(f.gu_type)] ^= 0x80;
             gpu_expert(L, bad, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_bad, s);
             const double rel_gate = rel(got_bad, got_g);
-            const bool seen = rel_down > 1e-2 && other_rows_differ == 0 && rel_gate > 1e-4 && std::isfinite(rel_down) &&
-                              std::isfinite(rel_gate);
+            const double gate_down = 1e-2 * ((double) ggml_blck_size((ggml_type) f.d_type) / 256.0) * (512.0 / (double) FF);
+            const bool seen = rel_down > gate_down && other_rows_differ == 0 && rel_gate > 1e-4 &&
+                              std::isfinite(rel_down) && std::isfinite(rel_gate);
             std::printf("          negative control: down row %lld's scale byte flipped moves that row by rel %.2e "
-                        "(> 1e-2) and %zu other rows by any bit (0); gate row %lld's moves the output by rel %.2e "
-                        "(> 1e-4): %s\n", (long long) rd, rel_down, other_rows_differ, (long long) rg, rel_gate,
-                        seen ? "yes" : "*** NO ***");
+                        "(> %.1e) and %zu other rows by any bit (0); gate row %lld's moves the output by rel %.2e "
+                        "(> 1e-4): %s\n", (long long) rd, rel_down, gate_down, other_rows_differ, (long long) rg,
+                        rel_gate, seen ? "yes" : "*** NO ***");
             if (!seen) ++failures;
+            cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);   // the good blob back for (c2), (d)
         }
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
             // the formats without a decode-once split take the per-entry kernels either way)
