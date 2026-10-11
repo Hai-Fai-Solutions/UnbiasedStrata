@@ -235,7 +235,10 @@ uint64_t host_ram_cap() { return g_host_ram_cap; }
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     if (!host_available_memory_raw(m, meminfo, self_cgroup, cgroup_root)) return false;
-    if (g_host_ram_cap > 0) {   // --ram-cap: the machine this engine pretends to run on
+    // --ram-cap: the machine this engine pretends to run on.  The cap is what that machine would report AVAILABLE,
+    // so "a 12 GiB machine" is --ram-cap 12 only if nothing else is resident; the 12 GiB VM 211 reports ~10 GiB
+    // available with its kernel and services, and emulating it exactly is --ram-cap 10.
+    if (g_host_ram_cap > 0) {
         m.available = std::min(m.available, g_host_ram_cap);
         m.cgroup_limit = std::min(m.cgroup_limit, g_host_ram_cap);
     }
