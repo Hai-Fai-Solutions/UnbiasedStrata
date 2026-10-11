@@ -24,7 +24,16 @@ namespace strata::plan {
 struct VramPlanInput {
     uint64_t budget_bytes = 0;         ///< VRAM the engine may use: free at start, or `cap - used` under --vram-cap
     uint64_t weights_bytes = 0;        ///< the non-expert weights on the GPU (census of the file, token_embd excluded)
-    uint64_t drafter_bytes = 0;        ///< the MTP draft block: dense + experts in VRAM + ring KV + logits
+    uint64_t drafter_bytes = 0;        ///< the MTP draft block's weights in VRAM (dense + experts); 0 without --mtp
+    /// Qwen3.6 step 4 (docs/qwen36-port/step4-drafter.md section 7): the drafter's K/V is the WHOLE context, not a
+    /// ring (dense attention: no --kv-resident), in the format --kv asks for, over its one attention layer; counted
+    /// per token here so a lowered context lowers it too.  0 without --mtp.
+    uint64_t drafter_kv_bytes_per_token = 0;
+    /// the draft head over the draft vocabulary's subset (n_dvocab x the head's row bytes) plus the draft logits:
+    /// what MtpDrafter::bind allocates; 0 without --mtp
+    uint64_t drafter_head_bytes = 0;
+    /// the drafter's identity selection ids, T x max_cells x 4 B (T = --spec): per token; 0 without --mtp
+    uint64_t drafter_ids_bytes_per_token = 0;
     uint64_t kv_bytes_per_token = 0;   ///< the KV format's bytes per token over every attention layer
     uint64_t session_bytes = 0;        ///< rope table, GDN state, scratch
     uint64_t cuda_context_bytes = 0;   ///< the driver's own share, ~230 to 300 MiB, when `budget_bytes` is a card's
@@ -58,10 +67,19 @@ struct VramPlan {
     std::string refusal;               ///< non-empty when !fits: the numbers and the smaller file
 };
 
+/// Everything that grows with the context: the trunk's KV and the drafter's K/V and ids, per token.
+inline uint64_t vram_plan_per_token(const VramPlanInput& in) {
+    return in.kv_bytes_per_token + in.drafter_kv_bytes_per_token + in.drafter_ids_bytes_per_token;
+}
+/// The drafter's whole share at `context` tokens: its weights, its K/V over the context, its head and ids.
+inline uint64_t vram_plan_drafter(const VramPlanInput& in, int64_t context) {
+    return in.drafter_bytes + in.drafter_head_bytes +
+           (in.drafter_kv_bytes_per_token + in.drafter_ids_bytes_per_token) * (uint64_t) context;
+}
 /// The fixed set at `context` tokens.
 inline uint64_t vram_plan_fixed(const VramPlanInput& in, int64_t context) {
-    return in.weights_bytes + in.drafter_bytes + in.kv_bytes_per_token * (uint64_t) context + in.session_bytes +
-           in.cuda_context_bytes + in.reserve_bytes + in.prompt_bytes;
+    return in.weights_bytes + vram_plan_drafter(in, context) + in.kv_bytes_per_token * (uint64_t) context +
+           in.session_bytes + in.cuda_context_bytes + in.reserve_bytes + in.prompt_bytes;
 }
 
 inline VramPlan make_vram_plan(const VramPlanInput& in) {
@@ -71,9 +89,10 @@ inline VramPlan make_vram_plan(const VramPlanInput& in) {
     if (p.fixed_bytes > in.budget_bytes) {
         // lower the context toward the floor: the largest multiple of `context_step` the budget holds
         const uint64_t without_kv = vram_plan_fixed(in, 0);
+        const uint64_t per_token = vram_plan_per_token(in);
         int64_t ctx = 0;
-        if (in.budget_bytes > without_kv && in.kv_bytes_per_token > 0) {
-            ctx = (int64_t) ((in.budget_bytes - without_kv) / in.kv_bytes_per_token);
+        if (in.budget_bytes > without_kv && per_token > 0) {
+            ctx = (int64_t) ((in.budget_bytes - without_kv) / per_token);
             ctx -= ctx % (in.context_step > 0 ? in.context_step : 1);
         }
         if (ctx < in.context_floor) {
@@ -82,7 +101,10 @@ inline VramPlan make_vram_plan(const VramPlanInput& in) {
             const auto mib = [](uint64_t b) { return std::to_string((b + (1u << 20) - 1) >> 20); };
             p.refusal = "the fixed set does not fit: at " + std::to_string(in.context) + " tokens it is " +
                         mib(p.fixed_bytes) + " MiB (weights " + mib(in.weights_bytes) + ", drafter " +
-                        mib(in.drafter_bytes) + ", KV " + mib(in.kv_bytes_per_token * (uint64_t) in.context) +
+                        mib(vram_plan_drafter(in, in.context)) + " (weights " + mib(in.drafter_bytes) + ", K/V " +
+                        mib(in.drafter_kv_bytes_per_token * (uint64_t) in.context) + ", head " + mib(in.drafter_head_bytes) +
+                        ", ids " + mib(in.drafter_ids_bytes_per_token * (uint64_t) in.context) + "), KV " +
+                        mib(in.kv_bytes_per_token * (uint64_t) in.context) +
                         ", session " + mib(in.session_bytes) + ", CUDA context " + mib(in.cuda_context_bytes) +
                         ", reserve " + mib(in.reserve_bytes) + ", prompt buffers " + mib(in.prompt_bytes) +
                         "), at the floor of " + std::to_string(in.context_floor) + " tokens " + mib(at_floor) +
@@ -126,7 +148,13 @@ inline std::string vram_plan_text(const VramPlanInput& in, const VramPlan& p, co
     std::string s;
     s += std::string(indent) + "VRAM budget " + mib(in.budget_bytes) + " MiB\n";
     s += std::string(indent) + "fixed set at " + std::to_string(p.context) + " tokens: " + mib(p.fixed_bytes) +
-         " MiB = weights " + mib(in.weights_bytes) + " + drafter " + mib(in.drafter_bytes) + " + KV " + mib(p.kv_bytes) +
+         " MiB = weights " + mib(in.weights_bytes) + " + drafter " + mib(vram_plan_drafter(in, p.context)) +
+         (vram_plan_drafter(in, p.context) ? " (weights " + mib(in.drafter_bytes) + ", K/V " +
+                                                  mib(in.drafter_kv_bytes_per_token * (uint64_t) p.context) + ", head " +
+                                                  mib(in.drafter_head_bytes) + ", ids " +
+                                                  mib(in.drafter_ids_bytes_per_token * (uint64_t) p.context) + ")"
+                                            : std::string(" (no --mtp)")) +
+         " + KV " + mib(p.kv_bytes) +
          " + session " + mib(in.session_bytes) + " + CUDA context " + mib(in.cuda_context_bytes) + " + reserve " +
          mib(in.reserve_bytes) + (in.prompt_bytes ? " + prompt buffers " + mib(in.prompt_bytes) : std::string(" (prefill borrows cache slots)")) + "\n";
     if (!p.fits) {

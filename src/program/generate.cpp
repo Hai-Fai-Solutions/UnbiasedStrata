@@ -2198,9 +2198,28 @@ int main(int argc, char** argv) {
                     weights += b;
                 }
             in.weights_bytes = weights;
-            // the draft block in VRAM (its dense and experts), its ring KV and 8 x n_vocab logits; the plain file has no
-            // block, and the drafter then comes from the Q4_K_XL file's blk.40 (464 MiB of experts, 40 of dense)
-            in.drafter_bytes = (draft ? draft : (504ull << 20)) + (16ull << 20);
+            // the drafter (step4-drafter.md section 7), only when one is asked for: the draft block's weights in VRAM
+            // (its dense and experts; the plain file has no block and the pack then comes from the -MTP file's blk.40:
+            // 464 MiB of experts, 40 of dense), its K/V over the WHOLE context in the --kv format (counted per token
+            // below), the draft head over the pack's draft vocabulary (or the whole head) at the file's head row bytes
+            // plus 8 x n_vocab logits, and the identity ids T x cells x 4
+            if (!o.mtp.empty()) {
+                in.drafter_bytes = draft ? draft : (504ull << 20);
+                int64_t n_dvocab = g.n_vocab;
+                uint64_t head_row = 0;
+                for (size_t i = 0; i < model.size(); ++i)
+                    for (const strata::TensorInfo& t : model.shard(i).tensors())
+                        if (t.name == "output.weight" && t.shape.size() > 1 && t.shape[1] > 0) {
+                            n_dvocab = (int64_t) t.shape[1];
+                            head_row = strata::tensor_payload_bytes(t) / (uint64_t) t.shape[1];
+                        }
+                const int64_t n_vocab_file = n_dvocab;
+                std::error_code ec;
+                const auto dv = std::filesystem::file_size(o.mtp + "/draft_vocab.bin", ec);
+                if (!ec && dv >= 4) n_dvocab = (int64_t) (dv / 4);
+                in.drafter_head_bytes = (uint64_t) n_dvocab * head_row + (uint64_t) 8 * (uint64_t) n_vocab_file * 4;
+                in.drafter_ids_bytes_per_token = (uint64_t) std::max(o.spec, 1) * 4;
+            }
             in.n_experts = g.n_layers * g.n_expert;
             const auto& lay = strata::kernels::cpu::expert_layout();
             in.mean_blob = lay.native && lay.total > 0 ? lay.total / (uint64_t) in.n_experts
@@ -2212,6 +2231,8 @@ int main(int argc, char** argv) {
         // KV per token over the attention layers, in the format asked for (dense attention keeps every cell in VRAM)
         const double kv_elem = o.kv == "q4_0" ? 18.0 / 32.0 : o.kv == "int8" ? 1.0 + 2.0 / 64.0 : o.kv == "k8v4" ? 816.0 / 1024.0 : 2.0;
         in.kv_bytes_per_token = (uint64_t) (g.n_qsa_layers() * 2 * g.n_head_kv * g.head_dim * kv_elem);
+        // the drafter's one attention layer, the same format, the whole context (no ring without --kv-resident)
+        if (!o.mtp.empty()) in.drafter_kv_bytes_per_token = (uint64_t) (2 * g.n_head_kv * g.head_dim * kv_elem);
         // the session: one RoPE table (max_cells x n_rot/2 x 2 floats), the GDN state, ~36 MiB of scratch
         in.session_bytes = (uint64_t) o.max_context * (uint64_t) g.n_rot * 4 +
                            (uint64_t) g.n_gdn_layers() * ((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +

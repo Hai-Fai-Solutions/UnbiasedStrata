@@ -111,6 +111,39 @@ void ladder() {
           "24 GB, Q4 borrow: ~1,090 MiB spare (" + std::to_string(p24.spare_bytes / MiB) + ")");
 }
 
+// Qwen3.6 step 4 (step4-drafter.md section 7): the drafter's term is its weights, its K/V over the WHOLE context in
+// the --kv format, the draft head subset with the logits, and the identity ids; the step-2 line (weights + 16 MiB)
+// undercounted it.  The per-token part lowers with the context.
+void drafter() {
+    VramPlanInput in = arm(true, true, 24576);
+    in.drafter_bytes = 506 * MiB;
+    in.drafter_kv_bytes_per_token = 2 * 2 * 256 * 2;      // fp16 K and V, 2 KV heads x 256: 1,024 B per cell
+    in.drafter_head_bytes = 106299ull * 2176 + 8ull * 248320 * 4;   // the Q8_0 head's subset (221 MiB) + logits
+    in.drafter_ids_bytes_per_token = 4 * 4;              // --spec 4
+    const uint64_t drafter = strata::plan::vram_plan_drafter(in, 262144);
+    check(drafter / MiB >= 506 + 512 + 221 + 7 + 4 && drafter / MiB <= 506 + 512 + 229 + 4 + 2,
+          "24 GB, Q4 borrow, --mtp at 262,144 fp16: the drafter is weights 506 + K/V 512 + head 221 + logits 7.6 + ids 4 MiB (" +
+          std::to_string(drafter / MiB) + ")");
+    const VramPlan p = strata::plan::make_vram_plan(in);
+    const VramPlan p0 = strata::plan::make_vram_plan(arm(true, true, 24576));
+    check(p.fits && p.fixed_bytes == p0.fixed_bytes - 520 * MiB + drafter && p.vram_slots == derive(in),
+          "the fixed set grows by the drafter's whole share and the slots derive from it (" + std::to_string(p.vram_slots) +
+          " vs " + std::to_string(p0.vram_slots) + " at the step-2 line)");
+    // the lowering counts the drafter's per-token K/V and ids: a budget that holds the fixed set at 0 tokens plus
+    // exactly 200,000 tokens' worth of per-token bytes lowers to 196,608 (the step), not to what the trunk's KV alone
+    // would give
+    VramPlanInput low = in;
+    low.budget_bytes = strata::plan::vram_plan_fixed(in, 0) + strata::plan::vram_plan_per_token(in) * 200000;
+    const VramPlan pl = strata::plan::make_vram_plan(low);
+    check(pl.fits && pl.lowered && pl.context == 196608,
+          "a budget 200,000 tokens of trunk KV + drafter K/V + ids above the fixed set lowers to 196,608 (" +
+          std::to_string(pl.context) + ")");
+    VramPlanInput none = arm(true, true, 24576);
+    none.drafter_bytes = 0;
+    check(strata::plan::vram_plan_text(none, strata::plan::make_vram_plan(none)).find("(no --mtp)") != std::string::npos,
+          "without --mtp the plan says so and counts no drafter");
+}
+
 void tiers() {
     // the RAM tier at the replay's 9.5 GB usable (section 4.3: Q4 ~4,950 experts, IQ3 ~8,760), the 1080 Ti's VRAM
     // slots, and the disk tier that remains at Q4 (~1,740 with borrowing, ~2,780 without)
@@ -182,6 +215,7 @@ int main(int argc, char** argv) {
     }
     std::printf("vram_plan_test (docs/QWEN36-35B-A3B.md table 4.3)\n");
     ladder();
+    drafter();
     tiers();
     lowering();
     std::printf(g_fail ? "vram_plan_test: %d FAILED\n" : "vram_plan_test: all passed\n", g_fail);
