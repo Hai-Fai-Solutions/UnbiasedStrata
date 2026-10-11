@@ -513,6 +513,26 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(qwen36_block_test PROPERTIES FIXTURES_REQUIRED "qwen36_synth_data;qwen36_block_data"
                          SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
+  # Qwen3.6 step 4 (docs/qwen36-port/step4-runner.md): the verify window on a native pack of the synthetic model at
+  # the real per-layer geometry (tests/python/qwen36_runner_fixture.py: the GGUF, the pack through tools/iq_pack.py,
+  # the oracle's dumps), held to the oracle per row and position and to the single-token path bit for bit; then the
+  # streaming runner (the `strata` binary: chunked prefill, then windows teacher-forced to the oracle) through
+  # tests/python/qwen36_runner_check.py, with the 4 KB mutation gate.  Needs python3 with numpy and a CUDA device.
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT _q36_python STREQUAL "")
+    add_executable(qwen36_verify_test tests/cuda/qwen36_verify_test.cpp)
+    target_link_libraries(qwen36_verify_test PRIVATE strata_engine strata_artifact)
+    add_test(NAME qwen36_runner_fixtures
+             COMMAND ${_q36_python} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen36_runner_fixture.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/qwen36_runner)
+    set_tests_properties(qwen36_runner_fixtures PROPERTIES FIXTURES_SETUP qwen36_runner_data TIMEOUT 1800
+                         ENVIRONMENT "STRATA_GGUF_PY=${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/gguf-py")
+    add_test(NAME qwen36_verify_test COMMAND qwen36_verify_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_runner)
+    set_tests_properties(qwen36_verify_test PROPERTIES FIXTURES_REQUIRED qwen36_runner_data SKIP_RETURN_CODE 77 TIMEOUT 600)
+    add_test(NAME qwen36_runner_check
+             COMMAND ${_q36_python} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen36_runner_check.py
+                     --strata $<TARGET_FILE:strata> --fixture ${CMAKE_CURRENT_BINARY_DIR}/qwen36_runner)
+    set_tests_properties(qwen36_runner_check PROPERTIES FIXTURES_REQUIRED qwen36_runner_data SKIP_RETURN_CODE 77 TIMEOUT 900)
+  endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
