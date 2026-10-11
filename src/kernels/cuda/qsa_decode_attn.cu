@@ -442,6 +442,170 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
+// The single-chunk form of the kernel above: PR #540's body as it was, with G and the null-ids identity.  A state
+// whose capacity is at most kMaxChunks x 64 = 8,192 cells (every Flash-Next state: cap 2,051) runs THIS one, so
+// Flash-Next's Pascal path is the old kernel to the instruction (the looped form costs 16-28 registers on sm_61 and
+// 15% on the Q4_0 pool at 2,051 cells; capping the registers spilled and cost more).  The looped form above runs
+// only for a capacity past 8,192, i.e. the dense model's long-context states.
+template <int KV_MODE, int G>
+__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75_single(const float* __restrict__ q, QsaAttnPools p,
+                                                             const int32_t* __restrict__ ids,
+                                                             const int32_t* __restrict__ step, int n_kv_heads,
+                                                             int page_size, float scale, float* __restrict__ part_acc,
+                                                             float* __restrict__ part_m, float* __restrict__ part_l,
+                                                             int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+    if (ids != nullptr) ids += (size_t) blockIdx.z * (size_t) cap;   // null: the identity (dense attention)
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    static_assert(G == 2 || G % 4 == 0, "the value loop reads the weights as float4 (one float2 at G 2)");
+    __shared__ __align__(16) float sq[G][HD];     // 12 KB at G 12: this KV head's query heads (dead once the scores are done)
+    __shared__ float sp[G][CHUNK];                // scores
+    __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
+    // probabilities, cell-major: the value loop reads one cell's 12 as three float4.  They are first written after the
+    // __syncthreads that ends the score phase, the last reader of sq, so they share its storage (64 x 12 of its 256 x 12
+    // floats) and the block's shared memory stays what it was before the cell-major layout.
+    float (*const spt)[G] = reinterpret_cast<float (*)[G]>(&sq[0][0]);
+    static_assert(CHUNK * G <= G * HD, "spt must fit in sq");
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, kvh = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < G * HD; i += THREADS) sq[i / HD][i % HD] = q[(size_t) (kvh * G) * HD + i];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids != nullptr ? ids[c0 + t] : c0 + t;
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.  NC cells per step
+    // (warp + 8 * (i + j)): a lane's q slice comes out of shared memory once for all of them, which cuts the traffic
+    // that bounds this phase (24 x 16 B per lane per cell, against the FMAs) by NC; every dot product is the same
+    // expression as for a single cell, so the scores are unchanged.
+    constexpr int NC = 2;   // 4 measured slower on a V100 (the registers cost occupancy)
+    const int hd = head_of_lane(lane);
+    for (int i = 0; i < CHUNK / WARPS; i += NC) {
+        int cc[NC];
+        bool all_ok = true;
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            cc[j] = warp + WARPS * (i + j);
+            all_ok = all_ok && cc[j] < n_here && srow[cc[j]] >= 0;
+        }
+        if (all_ok) {
+            float kk[NC][8];
+#pragma unroll
+            for (int j = 0; j < NC; ++j) load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j]);
+            float pp[NC][16];
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8]);
+                const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + 4]);
+#pragma unroll
+                for (int j = 0; j < NC; ++j)
+                    pp[j][h] = kk[j][0] * qa.x + kk[j][1] * qa.y + kk[j][2] * qa.z + kk[j][3] * qa.w +
+                               kk[j][4] * qb.x + kk[j][5] * qb.y + kk[j][6] * qb.z + kk[j][7] * qb.w;
+            }
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+#pragma unroll
+                for (int h = G; h < 16; ++h) pp[j][h] = 0.0f;
+                const float sj = reduce12(pp[j], lane);
+                if ((lane & 1) == 0 && hd < G) sp[hd][cc[j]] = sj * scale;
+            }
+        } else {
+            for (int k = 0; k < NC; ++k) {   // a masked or out-of-range cell in the group: one cell at a time
+                const int c = cc[k];
+                if (c >= n_here || srow[c] < 0) {
+                    if (lane < G) sp[lane][c] = -FLT_MAX;
+                    continue;
+                }
+                float k8[8];
+                load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+                float part[16];
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8]);
+                    const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + 4]);
+                    part[h] = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                              k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+                }
+#pragma unroll
+                for (int h = G; h < 16; ++h) part[h] = 0.0f;
+                const float s = reduce12(part, lane);
+                if ((lane & 1) == 0 && hd < G) sp[hd][c] = s * scale;
+            }
+        }
+    }
+    __syncthreads();
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+        spt[lane][h] = ea;
+        spt[lane + 32][h] = eb;
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    __syncthreads();
+    // values: thread t owns dimension t for all G heads.
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    // One cell's G weights (broadcast float4 loads) into the G accumulators; the cells are folded in
+    // ascending order, so the sums are the plain loop's, bit for bit.
+    const auto fold = [&](int c, float v) {
+        if constexpr (G == 2) {
+            const float2 w = *reinterpret_cast<const float2*>(spt[c]);
+            acc[0] = fmaf(w.x, v, acc[0]);  acc[1] = fmaf(w.y, v, acc[1]);
+        } else {
+            const float4* w4 = reinterpret_cast<const float4*>(spt[c]);
+#pragma unroll
+            for (int g4 = 0; g4 < G / 4; ++g4) {
+                const float4 w = w4[g4];
+                acc[4 * g4] = fmaf(w.x, v, acc[4 * g4]);          acc[4 * g4 + 1] = fmaf(w.y, v, acc[4 * g4 + 1]);
+                acc[4 * g4 + 2] = fmaf(w.z, v, acc[4 * g4 + 2]);  acc[4 * g4 + 3] = fmaf(w.w, v, acc[4 * g4 + 3]);
+            }
+        }
+    };
+    int c = 0;
+    // four cells at a time with their V loads issued together (the loop was one dependent load chain per cell);
+    // a group holding a masked cell (page -1, rare) leaves this loop and the scalar one below finishes the chunk.
+    for (; c + 4 <= n_here; c += 4) {
+        const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
+        if ((r0 | r1 | r2 | r3) < 0) break;
+        const float v0 = load_v1<KV_MODE>(p, r0, t), v1 = load_v1<KV_MODE>(p, r1, t);
+        const float v2 = load_v1<KV_MODE>(p, r2, t), v3 = load_v1<KV_MODE>(p, r3, t);
+        fold(c, v0);
+        fold(c + 1, v1);
+        fold(c + 2, v2);
+        fold(c + 3, v3);
+    }
+    for (; c < n_here; ++c) {
+        if (srow[c] < 0) continue;   // masked above, weight 0
+        fold(c, load_v1<KV_MODE>(p, srow[c], t));
+    }
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
 #endif  // STRATA_EXPERIMENTAL_SM60
 
 template <int G>
@@ -493,7 +657,7 @@ bool pre75_attn() {
     }
     return cc[dev] < 75;
 }
-#define STRATA_ATTN_CHUNK(M, G) (pre75_attn() ? attn_chunk_kernel_pre75<M, G> : attn_chunk_kernel<M, G>)
+#define STRATA_ATTN_CHUNK(M, G) (pre75_attn() ? (n_chunks < kMaxChunks ? attn_chunk_kernel_pre75_single<M, G> : attn_chunk_kernel_pre75<M, G>) : attn_chunk_kernel<M, G>)
 #else
 #define STRATA_ATTN_CHUNK(M, G) attn_chunk_kernel<M, G>
 #endif
