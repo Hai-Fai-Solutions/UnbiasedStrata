@@ -10,6 +10,10 @@ have a fixture that needs no 13 GB download.
     python3 tools/qwen36_synth_gguf.py OUT.gguf                       # default toy geometry, with the nextn layer
     python3 tools/qwen36_synth_gguf.py OUT.gguf --like-real REAL.gguf # geometry ratios, rope, eps, interval from REAL
     python3 tools/qwen36_synth_gguf.py OUT.gguf --no-nextn --fused-gate-up --fused-qkv
+    python3 tools/qwen36_synth_gguf.py OUT.gguf --gdn 2,4,128 --experts 256,8 --shexp-ff 512 --quant-shexp q8_0 --bf16-exact
+        # the engine's kernel fixture (step 3): state 128 (the CUDA GDN kernels are pinned to it), the real router
+        # shape, the shared expert at its real width in Q8_0, and the weights the engine reads as BF16 already
+        # BF16-representable, so the oracle and the kernels differ only by summation order
 
 Default geometry (all dims small enough to read, large enough that every reshape is non-degenerate):
 
@@ -77,6 +81,8 @@ class Cfg:
     fused_gate_up: bool = False
     fused_qkv: bool = False          # attention layers: one attn_qkv instead of attn_q/attn_k/attn_v
     expert_weights_scale: float | None = None   # a stray key: llama.cpp's qwen35moe loader does not read it
+    quant_shexp: str | None = None   # ggml type name for ffn_{gate,up,down}_shexp (e.g. "q8_0"); F32 when None
+    bf16_exact: bool = False         # round ssm_alpha/ssm_beta/ffn_gate_inp/ffn_gate_inp_shexp to BF16-representable F32
     seed: int = 0
 
     @property
@@ -156,19 +162,30 @@ def build_tensors(c: Cfg) -> list[tuple[str, np.ndarray]]:
     add = lambda n, a: T.append((n, np.ascontiguousarray(a, dtype=f32)))
     d = c.n_embd
 
+    def bf16(a):
+        """Round-to-nearest-even to BF16, returned as F32 (the engine's bf16_from_f32, strata/kernels/bf16_bits.hpp).
+        The pack rounds these F32 tensors to BF16 exactly when the low 16 bits are already zero (upstream-tooling.md
+        section 4), so a fixture written this way is one the engine reads bit-for-bit."""
+        a = np.ascontiguousarray(a, dtype=f32)
+        if not c.bf16_exact:
+            return a
+        u = a.view(np.uint32)
+        u = (u + ((u >> 16) & 1) + np.uint32(0x7FFF)) & np.uint32(0xFFFF0000)
+        return u.view(f32)
+
     add("token_embd.weight", rng.standard_normal((c.n_vocab, d)))
     add("output_norm.weight", normw(d))
     add("output.weight", lin(c.n_vocab, d, 2.0))
 
     def moe(p):
-        add(f"{p}.ffn_gate_inp.weight", lin(c.n_expert, d, 3.0))       # spread logits so top-k is decisive
+        add(f"{p}.ffn_gate_inp.weight", bf16(lin(c.n_expert, d, 3.0)))   # spread logits so top-k is decisive
         add(f"{p}.ffn_down_exps.weight", exps(c.n_expert, d, c.n_ff_exp))
         if c.fused_gate_up:                                              # ne [n_embd, 2*ff, E]: gate rows then up rows
             add(f"{p}.ffn_gate_up_exps.weight", exps(c.n_expert, 2 * c.n_ff_exp, d))
         else:
             add(f"{p}.ffn_gate_exps.weight", exps(c.n_expert, c.n_ff_exp, d))
             add(f"{p}.ffn_up_exps.weight", exps(c.n_expert, c.n_ff_exp, d))
-        add(f"{p}.ffn_gate_inp_shexp.weight", rng.standard_normal(d) / np.sqrt(d) * 2.0)
+        add(f"{p}.ffn_gate_inp_shexp.weight", bf16(rng.standard_normal(d) / np.sqrt(d) * 2.0))
         add(f"{p}.ffn_gate_shexp.weight", lin(c.n_ff_shexp, d))
         add(f"{p}.ffn_up_shexp.weight", lin(c.n_ff_shexp, d))
         add(f"{p}.ffn_down_shexp.weight", lin(d, c.n_ff_shexp))
@@ -199,8 +216,8 @@ def build_tensors(c: Cfg) -> list[tuple[str, np.ndarray]]:
             # spans both regimes (fast-forgetting and long-memory heads) over the 11-40 token sequences the tests use
             add(f"{p}.ssm_dt.bias", rng.uniform(-5.0, 1.0, c.ssm_v_heads))
             add(f"{p}.ssm_a", -np.exp(rng.uniform(np.log(0.05), np.log(20.0), c.ssm_v_heads)))
-            add(f"{p}.ssm_beta.weight", lin(c.ssm_v_heads, d, 1.5))
-            add(f"{p}.ssm_alpha.weight", lin(c.ssm_v_heads, d, 1.0))
+            add(f"{p}.ssm_beta.weight", bf16(lin(c.ssm_v_heads, d, 1.5)))
+            add(f"{p}.ssm_alpha.weight", bf16(lin(c.ssm_v_heads, d, 1.0)))
             add(f"{p}.ssm_norm.weight", normw(c.ssm_state))
             add(f"{p}.ssm_out.weight", lin(d, c.value_dim))
         moe(p)
@@ -276,8 +293,15 @@ def write(path: str, c: Cfg, comment: str = "") -> None:
     w.add_eos_token_id(3)
     w.add_add_bos_token(False)
 
+    qt = None
+    if c.quant_shexp:
+        from gguf import GGMLQuantizationType, quants
+        qt = GGMLQuantizationType[c.quant_shexp.upper()]
     for name, arr in build_tensors(c):
-        w.add_tensor(name, arr)
+        if qt is not None and any(name.endswith(f".{r}_shexp.weight") for r in ("ffn_gate", "ffn_up", "ffn_down")):
+            w.add_tensor(name, quants.quantize(arr, qt), raw_dtype=qt)      # gguf-py's reference quantizer (bit-identical to ggml)
+        else:
+            w.add_tensor(name, arr)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -294,6 +318,12 @@ def main() -> int:
     ap.add_argument("--fused-gate-up", action="store_true", help="ffn_gate_up_exps instead of ffn_gate_exps + ffn_up_exps")
     ap.add_argument("--fused-qkv", action="store_true", help="attention layers carry attn_qkv instead of attn_q/k/v")
     ap.add_argument("--expert-weights-scale", type=float, help="write a stray qwen35moe.expert_weights_scale key (llama.cpp ignores it)")
+    ap.add_argument("--gdn", metavar="K,V,S", help="GDN k-heads, v-heads, state size (default 4,8,16; the engine's kernels need S = 128)")
+    ap.add_argument("--experts", metavar="E,K", help="expert count and top-k (default 8,2; the real model is 256,8)")
+    ap.add_argument("--shexp-ff", type=int, metavar="N", help="shared expert width (default 32; the real model is 512)")
+    ap.add_argument("--quant-shexp", metavar="TYPE", help="write ffn_{gate,up,down}_shexp in this ggml type (e.g. q8_0) instead of F32")
+    ap.add_argument("--bf16-exact", action="store_true",
+                    help="ssm_alpha, ssm_beta, ffn_gate_inp, ffn_gate_inp_shexp hold BF16-representable F32 values (what the engine reads them as)")
     a = ap.parse_args()
     real = None
     if a.like_real:
@@ -308,6 +338,14 @@ def main() -> int:
     c.fused_gate_up |= a.fused_gate_up
     c.fused_qkv |= a.fused_qkv
     c.expert_weights_scale = a.expert_weights_scale
+    if a.gdn:
+        c.ssm_k_heads, c.ssm_v_heads, c.ssm_state = (int(x) for x in a.gdn.split(","))
+    if a.experts:
+        c.n_expert, c.n_expert_used = (int(x) for x in a.experts.split(","))
+    if a.shexp_ff:
+        c.n_ff_shexp = a.shexp_ff
+    c.quant_shexp = a.quant_shexp
+    c.bf16_exact = a.bf16_exact
     write(a.out, c, " like-real" if real else "")
     names = {norm_name(n) for n, _ in build_tensors(c)}
     print(f"wrote {a.out}: {len(build_tensors(c))} tensors, block_count {c.n_layer + int(c.nextn)}")
