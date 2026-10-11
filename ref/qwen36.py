@@ -647,6 +647,8 @@ def main() -> int:
     ap.add_argument("--force-topk", metavar="DIR", help="use the expert choices in DIR/ffn_moe_topk-<layer>.f32 (e.g. a llama.cpp dump) instead of the router's own")
     ap.add_argument("--force-inputs", metavar="DIR", help="start every layer from DIR/l_out-<il-1>.f32 (a llama.cpp dump of the same tokens): measures per-layer, not accumulated, error")
     ap.add_argument("--mtp", action="store_true", help="also run the nextn block on (tokens[1:], trunk hidden[:-1])")
+    ap.add_argument("--all-logits", action="store_true",
+                    help="also dump result_output_all: the head's logits at every position of the (last) chunk, for a runner held to the oracle position by position")
     a = ap.parse_args()
     toks = [int(t) for t in a.tokens.split(",")] if a.tokens else [ord(c) for c in a.text]
     m = Model(a.gguf)
@@ -664,9 +666,9 @@ def main() -> int:
         st = None
         for i in range(0, len(toks), a.split):
             last = i + a.split >= len(toks)
-            logits, h, st = m.forward(toks[i:i + a.split], d if last else None, st)
+            logits, h, st = m.forward(toks[i:i + a.split], d if last else None, st, all_logits=a.all_logits)
     else:
-        logits, h, _ = m.forward(toks, d)
+        logits, h, _ = m.forward(toks, d, all_logits=a.all_logits)
     print(f"{len(toks)} tokens; last-token logits: argmax {int(logits.argmax())}, max {logits.max():.6f}, sum {logits.sum():.6f}")
     d.close()
     if a.mtp:

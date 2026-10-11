@@ -83,8 +83,10 @@ def cfg(case: str, seed: int) -> qs.Cfg:
     return c
 
 
-def write(path: str, c: qs.Cfg) -> tuple[int, int]:
-    """qwen36_synth_gguf.write with the per-tensor forms above.  Returns (tensors, q8 tensors)."""
+def write(path: str, c: qs.Cfg, q8_embd: bool = False) -> tuple[int, int]:
+    """qwen36_synth_gguf.write with the per-tensor forms above.  Returns (tensors, q8 tensors).  `q8_embd` writes
+    token_embd.weight as Q8_0 too (a native pack's embedding must be a type iq_embed_rows serves: the runner's fixture,
+    tests/python/qwen36_runner_fixture.py); the prompt-path harness keeps it F32."""
     w = GGUFWriter(path, qs.ARCH)
     k = lambda s: f"{qs.ARCH}.{s}"
     w.add_name("qwen36-synth prefill-geometry")
@@ -122,7 +124,7 @@ def write(path: str, c: qs.Cfg) -> tuple[int, int]:
     n, nq = 0, 0
     for name, arr in qs.build_tensors(c):
         n += 1
-        if name.endswith(Q8_SUFFIXES) or name == "output.weight":
+        if name.endswith(Q8_SUFFIXES) or name == "output.weight" or (q8_embd and name == "token_embd.weight"):
             w.add_tensor(name, quants.quantize(arr, Q.Q8_0), raw_dtype=Q.Q8_0)   # the byte shape; gguf-py derives the elements
             nq += 1
         elif name.endswith(BF16_SUFFIXES):
