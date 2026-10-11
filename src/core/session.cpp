@@ -47,8 +47,9 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
-static uint64_t ple_hist_bytes() {
-    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
+static uint64_t ple_hist_bytes(const ModelGeometry& g) {
+    // a model without a PLE (Qwen3.6, `has_ple` false) carves none of it (Qwen3.6 port, step 2; inventory row 29)
+    return g.has_ple ? (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float) : 0;
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
@@ -68,7 +69,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
-    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
+    n += ple_hist_bytes(g);                      // the PLE's NG_HIST normalized history rows (0 without a PLE)
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
@@ -123,7 +124,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     block_buffers_init(g, s.block_arena, s.block);
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
-    s.ple_hist = (float*) take(ple_hist_bytes());
+    s.ple_hist = ple_hist_bytes(g) ? (float*) take(ple_hist_bytes(g)) : nullptr;
     s.R = s.block.R;
     return used;
 }
@@ -156,7 +157,7 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
     // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
     // boundary IS.
-    cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
+    if (s.ple_hist != nullptr) cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(g), cs);
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;

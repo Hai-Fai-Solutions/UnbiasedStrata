@@ -1,7 +1,11 @@
 # UnbiasedStrata build.  Needs CMake 3.24+, a C++20 compiler and the CUDA toolkit.  Nothing is downloaded.
 BUILD_DIR  ?= build
 # RTX 30 (86), RTX 40 (89) and RTX 50 (120) in one binary.  sm_120 needs CUDA 12.8+, and upstream recommends 13.0+.
+# Pascal (61) and Volta (70) are the experimental build (STRATA_EXPERIMENTAL_SM60, a CUDA 12.x toolkit): any arch below
+# 75 in the list switches it on - `make build CUDA_ARCHS=61` on the GTX 10 series (docs/qwen36-port/pascal-build.md).
 CUDA_ARCHS ?= 86;89;120
+SM60 := $(shell for a in $$(echo "$(CUDA_ARCHS)" | tr ';' ' '); do b=$${a%%-*}; case $$b in native|all|all-major) ;; *) [ "$$b" -lt 75 ] 2>/dev/null && echo ON;; esac; done | head -1)
+SM60_FLAG := $(if $(SM60),-DSTRATA_EXPERIMENTAL_SM60=ON,)
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
 
@@ -13,7 +17,7 @@ build:
 	@git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>/dev/null || \
 	  git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
-	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)"
+	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(CMAKE_EXTRA)
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target unbiased-strata
 	@echo "built: $(BUILD_DIR)/unbiased-strata"
 

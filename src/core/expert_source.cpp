@@ -223,8 +223,28 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 
 namespace detail {
 
+namespace {
+uint64_t g_host_ram_cap = 0;
+bool host_available_memory_raw(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
+                               const std::string& cgroup_root);
+}  // namespace
+
+void set_host_ram_cap(uint64_t bytes) { g_host_ram_cap = bytes; }
+uint64_t host_ram_cap() { return g_host_ram_cap; }
+
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
+    if (!host_available_memory_raw(m, meminfo, self_cgroup, cgroup_root)) return false;
+    if (g_host_ram_cap > 0) {   // --ram-cap: the machine this engine pretends to run on
+        m.available = std::min(m.available, g_host_ram_cap);
+        m.cgroup_limit = std::min(m.cgroup_limit, g_host_ram_cap);
+    }
+    return m.available > 0;
+}
+
+namespace {
+bool host_available_memory_raw(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
+                               const std::string& cgroup_root) {
     m = HostMemory{};
 #if defined(_WIN32)
     (void) meminfo; (void) self_cgroup; (void) cgroup_root;
@@ -320,6 +340,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     return m.available > 0;
 #endif
 }
+}  // namespace
 
 }  // namespace detail
 
@@ -1710,6 +1731,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
+    complement_count_ = 0;
+    for (const uint64_t off : complement_offsets_) complement_count_ += off != kNoComplement;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
@@ -1825,6 +1848,8 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     if (result != nullptr) ++reads_;
     return result;
 }
+
+int64_t FileExpertSource::complement_count() const { return complement_ready_ ? complement_count_ : 0; }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||

@@ -51,6 +51,8 @@ struct Options {
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
+    long long vram_cap_mib = 0;         // --vram-cap: the engine limits itself to a smaller card's VRAM
+    double ram_cap_gib = 0.0;           // --ram-cap: bounds the engine's RAM expert tier and pinned arena
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -66,8 +68,12 @@ void usage() {
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
-        "  --port N        port to listen on (default 8080)\n\n"
-        "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health.\n");
+        "  --port N        port to listen on (default 8080)\n"
+        "  --vram-cap MIB  emulate a smaller card: the engine uses at most MIB of VRAM (a 1080 Ti as 6 GB: 5722)\n"
+        "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n\n"
+        "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health (with the\n"
+        "engine's expert tiers and per-token counters: VRAM slots, RAM copies, mapped experts, hits, warm hints,\n"
+        "major page faults).\n");
 }
 
 bool file_exists(const std::string& p) {
@@ -551,6 +557,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
+        else if (a == "--vram-cap") o.vram_cap_mib = std::atoll(next("--vram-cap").c_str());
+        else if (a == "--ram-cap") o.ram_cap_gib = std::atof(next("--ram-cap").c_str());
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
@@ -580,17 +588,16 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
 
     // every file the engine needs must already be here: nothing is fetched
+    // Flash-Next ships as two shards and the second holds the PLE table, so it is the engine's --ple-gguf; a one-file
+    // model (Qwen3.6-35B-A3B) has no PLE and no second shard, and the engine decides from the file's architecture
     std::string shard2 = o.model;
     const size_t at = shard2.rfind("-00001-of-00002");
-    if (at == std::string::npos) {
-        std::fprintf(stderr, "unbiased-strata: --model must be the first shard (...-00001-of-00002.gguf)\n");
-        return 2;
-    }
-    shard2.replace(at, 15, "-00002-of-00002");
+    if (at != std::string::npos) shard2.replace(at, 15, "-00002-of-00002");
+    else shard2.clear();
     const std::string profile = o.pack + "/expert-profile.bin";
     for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
                                  o.mtp + "/draft_vocab.bin"})
-        if (!file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
+        if (!f.empty() && !file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
 
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
@@ -598,9 +605,12 @@ int main(int argc, char** argv) {
     }
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
     std::vector<std::string> eargs = {
-        "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
+        "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
-        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
+        "--mtp", o.mtp, "--max-context", std::to_string(o.ctx)};
+    if (!shard2.empty()) { eargs.push_back("--ple-gguf"); eargs.push_back(shard2); eargs.push_back("--ple-io"); eargs.push_back("ram"); }
+    if (o.vram_cap_mib > 0) { eargs.push_back("--vram-cap"); eargs.push_back(std::to_string(o.vram_cap_mib)); }
+    if (o.ram_cap_gib > 0.0) { eargs.push_back("--ram-cap"); eargs.push_back(std::to_string(o.ram_cap_gib)); }
     if (!o.mmproj.empty()) eargs.push_back("--vision");
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads <= 0) {
@@ -645,9 +655,28 @@ int main(int argc, char** argv) {
     httplib::Server http;
     g_server = &srv;
     g_http = &http;
+    // /health: ok or error, plus the engine's expert tiers and counters when it is between requests (STATS: VRAM
+    // slots and how many hold an expert, RAM copies, mapped experts, tokens served, VRAM hits of lookups, RAM-copy
+    // and file reads, warm hints, major page faults).  During a request the last reading is served, marked stale.
+    static std::string last_stats;
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = srv.engine.alive() ? 200 : 503;
-        res.set_content(srv.engine.alive() ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}", "application/json");
+        std::string body = srv.engine.alive() ? "{\"status\":\"ok\"" : "{\"status\":\"error\"";
+        if (srv.engine.alive()) {
+            std::unique_lock<std::mutex> lk(srv.engine.mu, std::try_to_lock);
+            if (lk.owns_lock()) {
+                std::string reply, err;
+                if (srv.engine.command("STATS", "STATS ", reply, err)) last_stats = reply.substr(6);
+                else if (last_stats.empty()) body += ",\"tiers_error\":\"" + err + "\"";
+                if (!last_stats.empty()) body += ",\"tiers\":" + last_stats;
+            } else if (!last_stats.empty()) {
+                body += ",\"tiers\":" + last_stats + ",\"tiers_stale\":true";
+            } else {
+                body += ",\"busy\":true";
+            }
+        }
+        body += "}";
+        res.set_content(body, "application/json");
     });
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         if (!srv.engine.alive()) return json_error(res, 503, "the engine is not running", "server_error");

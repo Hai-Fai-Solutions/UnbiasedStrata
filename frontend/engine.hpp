@@ -115,6 +115,21 @@ public:
         return r;
     }
 
+    /// One command line between requests (the caller holds `mu`): the engine's one-line reply whose first word is
+    /// `reply_prefix` lands in `reply`; an ERR line is the error.  `STATS` is the one in use (the server's /health).
+    bool command(const std::string& line, const char* reply_prefix, std::string& reply, std::string& err) {
+        if (!alive_) { err = "the engine is not running"; return false; }
+        if (!send(line + "\n")) { err = "the engine is not running"; return false; }
+        std::string got;
+        while (read_line(got)) {
+            if (got.rfind(reply_prefix, 0) == 0) { reply = got; return true; }
+            if (got.rfind("ERR", 0) == 0) { err = got.size() > 4 ? got.substr(4) : "the engine reported an error"; return false; }
+        }
+        alive_ = false;
+        err = "the engine exited";
+        return false;
+    }
+
     void quit() {
         if (pid_ > 0) {
             send("QUIT\n");
