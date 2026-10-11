@@ -20,8 +20,8 @@
 //   states[:-1]) at positions 1.. - the pairing common/speculative.cpp builds (token k with the hidden of k-1) -
 //   and dumps it to OUTDIR_mtp.  Needs CHUNK = 0.
 //
-// KV cache is F32 and flash attention is off, so the only difference to the numpy oracle is float
-// summation order.  Threads: 1.
+// KV cache is F32 and flash attention is off, so on an F32 file the only difference to the numpy oracle is float
+// summation order.  Threads: 1, or $QWEN36_THREADS.
 
 #include "llama.h"
 #include "ggml.h"
@@ -121,7 +121,8 @@ int main(int argc, char ** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 256;
     cp.n_batch = cp.n_ubatch = 256;
-    cp.n_threads = cp.n_threads_batch = 1;
+    const char * th = getenv("QWEN36_THREADS");
+    cp.n_threads = cp.n_threads_batch = th ? atoi(th) : 1;
     cp.type_k = GGML_TYPE_F32;
     cp.type_v = GGML_TYPE_F32;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;

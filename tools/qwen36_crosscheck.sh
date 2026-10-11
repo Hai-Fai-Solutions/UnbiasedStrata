@@ -69,8 +69,12 @@ run_case stray_scl stray_scale.gguf $T11 0 1
 [ -n "$REAL" ] && run_case like_real like_real.gguf $T40 0 1
 
 # (b) llama-eval-callback's own printout vs the oracle, for the 11-token prompt "hello world"
-"$B/bin/llama-eval-callback" -m base.gguf -p "hello world" -ctk f32 -ctv f32 -fa off -c 64 -t 1 -ngl 0 > eval_callback.txt 2>&1
+# llama-eval-callback's async logger drops its queue at exit, so the tail of the printout is sometimes cut off; retry until complete
+for try in 1 2 3 4 5 6 7 8; do
+  "$B/bin/llama-eval-callback" -m base.gguf -p "hello world" -ctk f32 -ctv f32 -fa off -c 64 -t 1 -ngl 0 > eval_callback.txt 2>&1
+  $PY "$REPO/tools/qwen36_check_eval_callback.py" o_base_11 eval_callback.txt --quiet --require-tail > /dev/null 2>&1 && break
+done
 grep -m1 "number of input tokens" eval_callback.txt
 echo "== llama-eval-callback printed stats vs o_base_11"
-$PY "$REPO/tools/qwen36_check_eval_callback.py" o_base_11 eval_callback.txt --quiet || fail=1
+$PY "$REPO/tools/qwen36_check_eval_callback.py" o_base_11 eval_callback.txt --quiet --require-tail || fail=1
 exit $fail

@@ -16,7 +16,7 @@ which is ggml memory order: ne0 fastest), named exactly as llama.cpp names it ("
 "result_output"; a name set twice gets "#2", "#3" - llama.cpp names "Kcur" and "Vcur" twice).  I32 tensors
 (the router's argsort and top-k) are written as float32 holding the integer.  OUTDIR/manifest.txt lists
 "<stem> <f32|i32> <ne0>,<ne1>,<ne2>,<ne3>".  `tools/qwen36_dump_llama.cpp` writes the same format from the real
-llama.cpp graph, and `tools/compare_dumps.py`-style comparison is in docs/qwen36-port/oracle-crosscheck.md.
+llama.cpp graph; `tools/qwen36_compare_dumps.py` compares them and docs/qwen36-port/oracle-crosscheck.md records the result.
 
 Shapes.  Numpy shapes are tokens-major: a (T, n_embd) activation is ggml ne [n_embd, T].  Weights are
 (out, in) so y = x @ W.T.  Per-head tensors are (T, heads, dim).
@@ -33,7 +33,7 @@ S in R^{S_v x S_k} with S[j, i] = v index j, k index i, the layout ggml calls "s
         d     = (v[t, h] - S @ k[t, hk]) * beta[t, h]                         ops.cpp:11016-11020  (delta rule)
         S    += d (x) k[t, hk]                                                ops.cpp:11023-11025
         o[t,h]= (S @ q[t, hk]) / sqrt(S_v)                                    ops.cpp:11028-11032
-    out   = (rms_norm(o) * ssm_norm) * SiLU(z)    <- SiLU, not sigmoid        qwen35moe.cpp:238-241, 478
+    out   = (rms_norm(o) * ssm_norm) * SiLU(z)    <- SiLU, not sigmoid        qwen35moe.cpp:272-275, 478
     y     = Wout out
 
 Scope: one sequence, causal, fresh or carried state, no sliding window, no YaRN (ext_factor 0, attn_factor 1:
@@ -382,7 +382,7 @@ class Model:
         dump("new_state", il, S_)
         o = dump("attn_output", il, out)                              # (T, Hv, S)
 
-        # gated norm (build_norm_gated, qwen35moe.cpp:233-242): rms_norm(o) * ssm_norm * SiLU(z)
+        # gated norm (build_norm_gated, qwen35moe.cpp:267-276): rms_norm(o) * ssm_norm * SiLU(z)
         normed = (dump("norm", il, rms_norm(o, hp.eps)) * self.t(f"{p}.ssm_norm.weight")).astype(F32)
         act = silu if self.opts["gdn_gate"] == "silu" else sigmoid
         gated = (normed * act(z.reshape(T, Hv, S))).astype(F32)
@@ -391,7 +391,7 @@ class Model:
         return dump("linear_attn_out", il, mm(fo, self.t(f"{p}.ssm_out.weight")))
 
     def attention(self, x, il, st: LayerState, pos, dump, mtp=False):
-        """build_layer_attn (qwen35moe.cpp:244-357): joint Q+gate projection, Q/K RMS norm, IMRoPE on 25%, causal
+        """build_layer_attn (qwen35moe.cpp:278-357): joint Q+gate projection, Q/K RMS norm, IMRoPE on 25%, causal
         GQA softmax attention, sigmoid output gate, output projection.  x (T, n_embd); pos (T,) absolute positions.
         mtp=True emits only the names graph_mtp (qwen35moe.cpp:621-668) sets, under its "mtp_" spelling."""
         hp = self.hp

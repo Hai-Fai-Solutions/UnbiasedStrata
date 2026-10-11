@@ -25,6 +25,7 @@ import numpy as np
 HEAD = re.compile(r"^common_debug_cb_eval:\s+(.+?) = \((\w+)\)\s+\w+\(.*\) = \{(\d+), (\d+), (\d+), (\d+)\}\s*$")
 NUM = re.compile(r"(?<![\w.])-?(?:\d+\.\d+|nan|inf)(?![\w.])")
 N_EDGE = 3
+TRUNCATED = None
 
 
 def printed_indices(ne):
@@ -60,6 +61,10 @@ def parse(path):
             if ln.strip().startswith("["):
                 body.extend(NUM.findall(ln))
             i += 1
+        if total is None:                 # llama.cpp's async log drops its queue at exit: the last block can be cut off
+            global TRUNCATED
+            TRUNCATED = name
+            continue
         yield name, typ, ne, [float(v) for v in body], total
 
 
@@ -70,6 +75,7 @@ def main():
     ap.add_argument("--tol", type=float, default=1e-4)
     ap.add_argument("--min-seams", type=int, default=100)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--require-tail", action="store_true", help="fail unless the printout reaches result_output")
     a = ap.parse_args()
     od = pathlib.Path(a.oracle)
     man = {}
@@ -111,10 +117,13 @@ def main():
             bad += 1
         if not ok or not a.quiet:
             print(f"{'ok  ' if ok else 'FAIL'}  {stem:34s} printed {len(vals):3d} values max|d| {dv:.2e}   sum oracle {osum: .6f} llama {total: .6f}  (|d|/L1 {ds:.1e})")
-    print(f"\nchecked {checked} named nodes, {bad} failed; worst printed-value diff {worst_val:.2e}, worst sum diff {worst_sum:.2e} (of L1 mass)")
+    if TRUNCATED:
+        print(f"note: the last block ({TRUNCATED}) was cut off by llama-eval-callback's log shutdown; rerun, or use tools/qwen36_dump_llama.cpp for the tail")
+    complete = "result_output" in seen
+    print(f"\nchecked {checked} named nodes ({'through result_output' if complete else 'tail missing'}), {bad} failed; worst printed-value diff {worst_val:.2e}, worst sum diff {worst_sum:.2e} (of L1 mass)")
     if skipped:
         print("skipped:", "; ".join(skipped[:6]), "..." if len(skipped) > 6 else "")
-    return 1 if bad or checked < a.min_seams else 0
+    return 1 if bad or checked < a.min_seams or (a.require_tail and not complete) else 0
 
 
 if __name__ == "__main__":
