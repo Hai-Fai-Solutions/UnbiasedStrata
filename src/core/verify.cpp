@@ -125,6 +125,30 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 
 }  // namespace
 
+bool verify_geometry_supported(const ModelGeometry& g, int64_t k, std::string& why) {
+    if (g.hc > 1 && !strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr)) {
+        why = "the fused hyper-connection read is built for n_embd 2560, hc 4, hc_lr 320, not " +
+              std::to_string(g.n_embd) + " / " + std::to_string(g.hc) + " / " + std::to_string(g.hc_lr);
+        return false;
+    }
+    if (k != g.n_expert_used) {
+        why = "the session routes top-" + std::to_string(k) + " but the file routes top-" +
+              std::to_string(g.n_expert_used) + " of " + std::to_string(g.n_expert) +
+              " experts (expert_used_count); the window reproduces the file's k";
+        return false;
+    }
+    if (k < 1 || k > g.n_expert) {
+        why = "k " + std::to_string(k) + " is outside 1.." + std::to_string(g.n_expert) + " experts";
+        return false;
+    }
+    if (g.ssm_state_size != 128 || g.ssm_d_conv != 4) {
+        why = "the T-token GDN kernels are built for state 128 and conv 4, not " + std::to_string(g.ssm_state_size) +
+              " / " + std::to_string(g.ssm_d_conv);
+        return false;
+    }
+    return true;
+}
+
 namespace {
 std::atomic<const Verifier*> g_diag_verifier{nullptr};
 void diag_active_verifier(std::FILE* f) {
@@ -329,13 +353,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     std::string why;
-    if (!layer_verify_compatible(why)) {
+    if (!layer_verify_compatible(g, why)) {
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
-        g.ssm_d_conv != 4) {
-        err = "verify: geometry differs from the artifact's";
+    if (!verify_geometry_supported(g, ss.k, why)) {
+        err = "verify: " + why;
         return false;
     }
     if (le_ < 0) le_ = g.n_layers;
@@ -557,7 +580,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
-    auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
+    if (HC == 1 && ple_on) {
+        err = "verify: the plain block (hc = 1) has no per-layer embedding, but the session's PLE is wired";
+        return false;
+    }
+    const float eps = (float) g.rms_eps;
+    auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };   // at hc = 1 the rows are contiguous: Rt(tb) spans n rows
+    // hc = 1: the plain block's F32 norm weights (layer.hpp, "the plain block"), checked as layer.cpp checks them
+    auto plain_w = [&](const LayerView& v, const char* suffix) -> const float* {
+        const WeightRef* w = need(v, suffix, err);
+        if (w == nullptr) return nullptr;
+        if (w->kind != WeightKind::F32 || w->elements != N || w->data == nullptr) {
+            err = v.name(suffix) + " is engine form " + std::to_string((int) w->kind) + " of " +
+                  std::to_string(w->elements) + " elements; the plain block reads F32 x " + std::to_string(N);
+            return nullptr;
+        }
+        return (const float*) w->data;
+    };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
@@ -622,7 +661,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 0, grp);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
-        const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
+        const WeightRef *wn[2] = {}, *wd[2] = {}, *wu[2] = {}, *wi[2] = {};
+        const float *w_attn = nullptr, *w_post = nullptr;   // hc = 1: the plain block's two norms
+        if (HC == 1) {
+            w_attn = plain_w(v, "attn_norm.weight");
+            if (w_attn == nullptr) return false;
+            w_post = plain_w(v, "post_attention_norm.weight");
+            if (w_post == nullptr) return false;
+        } else
         for (int h = 0; h < 2; ++h) {
             wn[h] = need(v, (std::string(pfx[h]) + "norm.weight").c_str(), err);
             wd[h] = need(v, (std::string(pfx[h]) + "down.weight").c_str(), err);
@@ -631,8 +677,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!wn[h] || !wd[h] || !wu[h] || !wi[h]) return false;
         }
         // the previous layer's FFN write, folded into this layer's first read (a control vector after it has
-        // already applied it)
-        bool pending = l > 0 && !cvec().covers(l - 1);
+        // already applied it); the plain block has no pending write (its residual adds are applied in place)
+        bool pending = HC > 1 && l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             if (grp == 0) {
                 if (all_resident_) wait_flag_ge(m_flag_, 1, cs);
@@ -693,9 +739,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
-        gr_read_group(0, pending, inj2_, inj_);
-        stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
+        try {
+            // x = rms_norm(R) * attn_norm over the group's n rows (`attn_norm-N`), or the GR read
+            if (HC == 1) plain_norm_rows(Rt(tb), w_attn, xm, N, eps, n, cs);
+            else gr_read_group(0, pending, inj2_, inj_);
+        } catch (const std::exception& e) {
+            err = "verify layer " + std::to_string(l) + " attn_norm: " + e.what();
+            return false;
+        }
+        stamp(l, 1, grp);
         try {
             if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
@@ -899,7 +952,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        gr_read_group(1, true, inj_, inj2_);
+        try {
+            if (HC == 1) {   // R += mixer out (`attn_residual-N`), then x = rms_norm(R) * post_attention_norm
+                plain_residual_rows(Rt(tb), bo_ + tb * N, N, n, cs);
+                plain_norm_rows(Rt(tb), w_post, xm, N, eps, n, cs);
+            } else gr_read_group(1, true, inj_, inj2_);
+        } catch (const std::exception& e) {
+            err = "verify layer " + std::to_string(l) + " post_attention_norm: " + e.what();
+            return false;
+        }
         static const bool sh_stream_env = [] {
             const char* e = std::getenv("STRATA_SH_STREAM");
             return !e || e[0] != '0';
@@ -998,7 +1059,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const char* e = std::getenv("STRATA_FUSE_HEAD_GR");
         return e && e[0] == '1';
     }();
-    const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
+    const bool fuse_head_gr = fuse_head_gr_env && HC > 1 && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -1091,7 +1152,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
-        if (l == g.n_layers - 1) {
+        if (HC == 1) {   // R += ffn out (`l_out-N`): in place, every layer; then a control vector if one covers it
+            try {
+                plain_residual_rows(Rt(tb), bo_ + tb * N, N, n, cs);
+                if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, N, nullptr, 0, nullptr, 0, false, cs);
+            } catch (const std::exception& e) {
+                err = "verify layer " + std::to_string(l) + " residual: " + e.what();
+                return false;
+            }
+        } else if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
@@ -1120,10 +1189,24 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
     {
-        const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
-                        *hu = wt.find("output_hc_up.weight");
-        if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
-        if (fuse_head_gr) {
+        const WeightRef *hn = nullptr, *hd = nullptr, *hu = nullptr;
+        if (HC > 1) {
+            hn = wt.find("output_hc_norm.weight"); hd = wt.find("output_hc_down.weight"); hu = wt.find("output_hc_up.weight");
+            if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        }
+        if (HC == 1 && head_ != nullptr && head_->loaded()) {
+            // the plain head: `result_norm = rms_norm(R) * output_norm` for the T rows in one launch (row t is the
+            // single-token `lm_head_mix`); the canonical head below goes through `lm_head`, which branches the same way
+            const WeightRef* wn = wt.find("output_norm.weight");
+            if (wn == nullptr) { err = "verify: output_norm.weight is missing (the plain block's head norm)"; return false; }
+            if (wn->kind != WeightKind::F32 || wn->elements != N || wn->data == nullptr) {
+                err = "verify: output_norm.weight is engine form " + std::to_string((int) wn->kind) + " of " +
+                      std::to_string(wn->elements) + " elements; the plain head reads F32 x " + std::to_string(N);
+                return false;
+            }
+            try { plain_norm_rows(R_, (const float*) wn->data, head_mixed_, N, eps, T, cs); }
+            catch (const std::exception& e) { err = std::string("verify output_norm: ") + e.what(); return false; }
+        } else if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
