@@ -3,8 +3,8 @@
 Run 2026-10-11 on this branch (`qwen36-oracle`), CPU only, F32 synthetic fixtures, against `third_party/llama.cpp` at 3cf0325.
 `ref/qwen36.py` (the numpy oracle) and the submodule's own graph agree on **every named tensor of every case**: 2,155 comparisons over 116 seam
 families, worst absolute error **1.1e-4** (on a tensor whose values reach 3.8), the router's integer outputs identical. The printed stats of
-`llama-eval-callback` agree on all 209 named nodes it prints. A reading that is wrong in any of the 7 places a port could plausibly get wrong
-fails the comparison at the layer that makes it.
+`llama-eval-callback` agree on all 209 named nodes it prints. A reading that is wrong in any of the 8 places a port could plausibly get wrong
+fails the comparison at the layer that makes it. Dequantization of the real file's types is bit-identical to ggml's (below).
 
 ## Reproduce
 
@@ -50,6 +50,7 @@ Both tools use one thread, so the only differences left are float32 summation or
 | `seed7` | seed 7 | 11 | different weights, so a coincidence in seed 0 cannot hide a bug; nextn |
 | `fused_gu` | `--fused-gate-up --seed 3` | 11 | `ffn_gate_up_exps` (gate rows then up rows) for trunk and nextn; nextn |
 | `fused_qkv` | `--fused-qkv --no-nextn --seed 4` | 11 | `attn_qkv` in the attention layer (Q, K, V rows in that order) |
+| `gqa4_2` | `--heads 4,2 --seed 11` | 40 | **non-degenerate GQA**: 4 query heads over 2 KV heads, so `kv = h // (n_head/n_head_kv)` is tested (every other fixture has one KV head, where any mapping passes); nextn |
 | `stray_scl` | `--expert-weights-scale 2.5 --seed 5` | 11 | the key is in the file; llama.cpp ignores it, so must the oracle; nextn |
 | `like_real` | `--like-real <MTP build>` | 40 | rope base 1e7, real eps, interval, head ratios, and the exact tensor-name set of the real file (32 of 32 patterns); nextn |
 
@@ -59,8 +60,8 @@ one nextn block at index 4.
 
 ## Results
 
-All 9 trunk cases: `0 failed` of 211 seams (215 with fused gate/up, 212 with fused qkv). The 5 nextn cases: `0 failed` of 50 (51 fused). Per seam family
-(max over all layers and all cases; "max abs value" is the largest magnitude of the llama.cpp tensor):
+All 10 trunk cases: `0 failed` of 211 seams (215 with fused gate/up, 212 with fused qkv). The 6 nextn cases: `0 failed` of 50 (51 fused). Per seam family
+(max over all layers and the first nine cases, 2,155 comparisons; the `gqa4_2` case adds 261 more, all within tolerance; "max abs value" is the largest magnitude of the llama.cpp tensor):
 
 #### Trunk (`qwen35moe` graph, 9 cases)
 
@@ -202,7 +203,7 @@ comparison crops the padding and requires it to be exactly zero for `kq_soft_max
 ### Negative controls: the comparison fails when the oracle reads the graph wrongly
 
 Each row runs the oracle with one `Model.opts` entry flipped to its rival (`ref/qwen36.py --opt KEY=VALUE`) against the same llama.cpp dump of `base_11`.
-All 7 fail, at the layer and seam that makes the mistake; `tools/test_qwen36_oracle.py` requires every one to move its seam by more than 5 % relative L1.
+All 8 fail, at the layer and seam that makes the mistake; `tools/test_qwen36_oracle.py` requires every one to move its seam by more than 5 % relative L1.
 
 | rival reading | first failing seam | seams failing / 211 | change at that seam (relative L1) | change in logits |
 | --- | --- | --- | --- | --- |
@@ -212,6 +213,7 @@ All 7 fail, at the layer and seam that makes the mistake; `tools/test_qwen36_ora
 | conv window applied in the opposite direction | `conv_output_raw-0` | 189 | 1.23 | 1.05 |
 | attention output gate skipped | `attn_gated-3` | 32 | 1.03 | 0.12 |
 | top-k weights not renormalized | `ffn_moe_weighted-0` | 152 | 0.14 | 0.12 |
+| query head h reads KV head `h % n_kv` instead of `h // (n_head/n_kv)` (on `gqa4_2`; invisible with one KV head) | `kq-3` | 36 | 0.74 (at `kqv-3`) | 0.13 |
 | RoPE on adjacent pairs (2p, 2p+1) instead of (p, p + n_rot/2) | `Qcur-3` | 37 | 0.20 (at `kqv-3`) | 0.04 |
 
 ## Formulas pinned (file:line in `third_party/llama.cpp`)
@@ -259,6 +261,46 @@ The trunk's `h_nextn` is the output-normed hidden state of every input token (`q
   `--require-tail` fails unless the printout reaches `result_output`; `qwen36_crosscheck.sh` retries up to 8 times. `tools/qwen36_dump_llama.cpp` writes files and is not affected.
 - **Tokenizer.** The fixture's vocabulary is the 128 ASCII byte tokens (GPT-2 byte-level BPE with a single dead merge), so `-p "text"` yields token id = ASCII code and `llama-eval-callback` can be driven by text.
 - **Stray metadata.** A `qwen35moe.expert_weights_scale` key changes nothing (case `stray_scl`); `expert_weights_norm` is not read either. `llama.cpp` warns about "unused tensor blk.4.*" when the nextn block is present and `--mtp` is not requested; harmless.
+
+## ref/load.py dequantization against ggml (real file)
+
+`tools/qwen36_check_dequant.py MODEL.gguf $B/qwen36-dequant` (the helper, `tools/qwen36_dequant_ggml.cpp`, calls ggml's own `to_float` on the raw bytes) on
+`Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`: **max |difference| 0.0 (bit-identical)** for `token_embd.weight` rows (Q6_K), `output.weight` and a dense Q6_K block, whole experts of
+`blk.0.ffn_gate_exps` (IQ2_S), `blk.0.ffn_down_exps` (IQ3_XXS) and `blk.34.ffn_down_exps` (IQ4_XS), two experts each. Independently, `model.input_embed` from the real llama.cpp graph
+(a `get_rows` of the Q6_K table, exact dequantization) equals the oracle's rows with max error 0.0 over the 4 smoke-test tokens. So every real-file difference below comes from activation
+quantization and summation order, not from the weights.
+
+## Tolerance policy for parity tests on the real file
+
+The oracle is F32 weights x F32 activations. llama.cpp and the CUDA paths round activations to Q8 (`Q8_K` blocks of 256 for K-quant and IQ weights, `Q8_0` blocks of 32 for Q4_0/Q8_0/IQ4_NL)
+before each quantized matmul; F32 weights (router, `ssm_alpha`/`ssm_beta`, conv) are not affected. On the real file that moves seams by percents and flips near-tied expert picks
+(12 tokens: 1,895 of 3,840 top-k slots differ position-wise once errors have compounded). Therefore:
+
+1. **Teacher-force expert selection** in any real-file parity test: `ref/qwen36.py --force-topk DIR` takes the choices from a dump's `ffn_moe_topk-<layer>.f32`
+   (the CUDA test feeds the oracle's own, or the engine's). Exact top-k agreement is checked only on the F32 fixtures (`tools/qwen36_crosscheck.sh`, where it is bit-identical in every case).
+2. **Compare per layer, not accumulated**: `--force-inputs DIR` starts every layer from the reference's `l_out-(il-1)`, so each seam's error is that layer's own. Accumulated error over 40
+   layers is 5-30x larger (table below, first block) and is not a usable tolerance.
+3. **Use these per-seam-class relative tolerances** (`||oracle - reference|| / ||reference||`, 12 tokens, 40 layers, topk and inputs forced). Column "F32 oracle" is the plain oracle; "Q8 oracle" is `--act-quant q8`:
+
+| seam class | F32 oracle median / max over layers | Q8 oracle median / max |
+| --- | --- | --- |
+| `attn_norm` (input is the forced residual) | 5e-8 / 7e-8 | 5e-8 / 7e-8 |
+| `linear_attn_qkv_mixed` (GDN in-projection) | 1.4e-2 / 1.8e-2 | 6.9e-7 / 7.5e-7 |
+| `linear_attn_out` (GDN output) | 3.8e-2 / 6.6e-2 | 7.8e-5 / 3.7e-4 |
+| `attn_output` (full attention, 10 layers) | 4.2e-2 / 6.3e-2 | 1.1e-4 / 6.7e-4 |
+| `ffn_moe_out` | 2.9e-2 / 5.3e-2 | 2.3e-3 / 5.3e-3 |
+| `ffn_out` (routed + shared) | 3.0e-2 / 4.7e-2 | 2.1e-3 / 4.5e-3 |
+| `l_out` (layer output) | 6.9e-3 / 2.7e-2 | 1.8e-4 / 1.4e-3 |
+| `result_output` (logits, last token) | 1.9e-2 | 4.0e-7 |
+
+   Against an F32-activation engine path, use the F32 column with a 2x margin (for example `qkv_mixed` 4e-2, `gdn_out`/`attn_out` 1.3e-1, `moe_out` 1.1e-1, `l_out` 5e-2, logits 4e-2). Against a path that
+   rounds activations to Q8 the way ggml does, use the Q8 column with a 4x margin.
+4. **Q8 mode is cheap and closes the gap**: `quantize_act` (about 25 lines) reproduces ggml's `quantize_row_q8_K_ref` / `quantize_row_q8_0_ref` and leaves 1e-6 to 1e-3 instead of 1e-2 to 1e-1; at layer 0
+   the GDN in-projection goes from 7.6e-3 to 6e-7. What remains in `ffn_moe_out` (2e-3) is the IQ2_S / IQ3_XXS integer dot product against float summation. For the last three rows of that
+   table the Q8 oracle is a better reference than the F32 one whenever the engine under test quantizes activations.
+5. The accumulated spread, for reference (`tools/qwen36_spread.py`, no forcing at all, medians over layers; F32 / Q8): `attn_norm` 1.3e-1 / 1.1e-1, `gdn_out` 1.9e-1 / 1.6e-1, `moe_out` 3.4e-1 / 2.8e-1,
+   `l_out` 5.6e-2 / 4.5e-2, logits 9.8e-2 / 5.9e-2; with only the top-k forced: `l_out` 2.1e-2 / 1.3e-2, logits 3.1e-2 / 3.2e-2. Greedy next-token and the top-5 ids still agree. Q8 mode does not close this one: chaotic
+   amplification through 40 layers, plus the attention layers (layer 3 alone takes `l_out-2` from 7e-3 to `attn_output-3` 2e-2), dominate, which is why the per-layer protocol above is the one to use.
 
 ## Not covered
 
