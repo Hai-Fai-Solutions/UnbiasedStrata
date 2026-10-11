@@ -2517,7 +2517,10 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        // bounded to the trunk: a -MTP file's draft block (blk.40 of Qwen3.6, `nextn_predict_layers`) carries the
+        // same projection names, is not in the trunk's pack (tools/iq_pack.py leaves it to the drafter's), and would
+        // otherwise be "absent from canonical table"; no Flash-Next file has a block past its trunk
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, g.n_layers)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
