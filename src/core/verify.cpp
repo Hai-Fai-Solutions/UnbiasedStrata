@@ -794,12 +794,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         SessionState& sx = slot_ss(t);
                         float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
                         gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
-                                            z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
-                                            (int) HK, (int) HV, 1, nullptr, cs, 0);
+                                            z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, g.gdn_gate(),
+                                            y_ + (size_t) t * ZV, (int) HK, (int) HV, 1, nullptr, cs, 0);
                     }
                 } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, nullptr, cs, tb);
+                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, g.gdn_gate(), y_,
+                                    (int) HK, (int) HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
@@ -1375,8 +1375,8 @@ bool Verifier::capture_commit(std::string& err) {
                 const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
                 gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_, (int) MT);
+                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, g.gdn_gate(),
+                                    y_dummy_, (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_, (int) MT);
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
@@ -1928,8 +1928,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C,
                                         gate_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV,
                                         beta_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV, z_ + (size_t) t * ZV,
-                                        (const float*) wnm->data, EPS, y_dummy_ + (size_t) t * ZV, (int) g.ssm_k_heads,
-                                        (int) HV, 1, keep, cs_);
+                                        (const float*) wnm->data, EPS, g.gdn_gate(), y_dummy_ + (size_t) t * ZV,
+                                        (int) g.ssm_k_heads, (int) HV, 1, keep, cs_);
                 }
                 ++gdn_index;
             } else {

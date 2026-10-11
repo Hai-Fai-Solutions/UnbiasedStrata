@@ -16,6 +16,7 @@
 #pragma once
 
 #include "strata/core/weights.hpp"
+#include "strata/kernels/gdn.hpp"
 
 #include <cstdint>
 #include <string>
@@ -83,6 +84,12 @@ struct ModelGeometry {
     int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
     /// Whether the full-attention layers carry the sparse indexer (QSA).  Qwen3.6's attention is dense.
     bool has_indexer() const { return arch == ModelArch::Qwen4Exp; }
+    /// The GDN output gate: `rms_norm(o) * ssm_norm * act(z)` with act = sigmoid for Flash-Next and SiLU for Qwen3.6
+    /// (geometry-inventory.md row 39; `kernels::GdnGate`).  From the architecture, like `hc` and the indexer: no key
+    /// says it.  Every GDN output kernel takes this value from the layer; none reads a global.
+    kernels::GdnGate gdn_gate() const {
+        return arch == ModelArch::Qwen35Moe ? kernels::GdnGate::Silu : kernels::GdnGate::Sigmoid;
+    }
 
     /// The members that follow from others: conv channels `2*S*k_heads + S*v_heads` and the value dim
     /// `S*v_heads`.  They are stored (the kernels read them as plain members) and derived here, so a file that

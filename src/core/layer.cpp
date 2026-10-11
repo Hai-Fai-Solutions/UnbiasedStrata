@@ -314,15 +314,15 @@ st_begin(layer, 12, stream);
     st_end(layer, 13, stream); st_begin(layer, 14, stream);
 // ---- 6. the recurrence.  q and k are the (16, 128) views; v is the (48, 128) view.  The stage marks for
 // it live at the end of the alpha/beta/gate line above, because the gate and the step are one sequence.
-// ---- 7. z, then y = rms_norm(o) * ssm_norm * sigmoid(z).  SIGMOID, not SiLU.
+// ---- 7. z, then y = rms_norm(o) * ssm_norm * act(z).  SIGMOID for Flash-Next, SiLU for Qwen3.6: `g.gdn_gate()`.
 // qkv's native quantize of `mixed` is still in the shared q8_1 scratch: nothing native ran in between.
 if (!gemv_quantized(*w_gate, p_gate, f_gate, b.x_q8_0, b.x_q8k, b.z, g.n_embd, g.ssm_value_dim, v.name("attn_gate.weight"), stream, err, mixed,
                     w_qkv->native_data != nullptr && w_gate->native_data != nullptr)) return false;
 try {
-    if (fused_gdn) fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS, b.y,
-                                       (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
-    else if (native_gdn_enabled()) native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
-    else gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
+    if (fused_gdn) fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS,
+                                       g.gdn_gate(), b.y, (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
+    else if (native_gdn_enabled()) native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, g.gdn_gate(), stream);
+    else gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, g.gdn_gate(), stream);
 } catch (const std::exception& error) { err = v.name("gdn_out_norm") + ": " + error.what(); return false; }
 st_end(layer, 14, stream);
 // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
