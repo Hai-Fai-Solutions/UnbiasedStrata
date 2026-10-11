@@ -88,32 +88,9 @@ void check_sync(const char* what) {
 /// Geometry validation.  A silently wrong `head_dim % 4` would corrupt the gather's uint2 copy and a silently
 /// wrong `n_head % n_head_kv` would produce a plausible attention with the wrong key, so both are refused.
 void validate(const QsaShapes& s, const char* who) {
-    // dense attention (Qwen3.6, qsa_dense): no indexer, so the three indexer widths are 0 together; the KV, gather,
-    // attend and gate kernels do not read them.  A shape with SOME of them zero is a half-set-up geometry.
-    const bool dense = s.idx_n_head == 0 && s.idx_dim == 0 && s.idx_top_k == 0;
-    if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || (!dense && (s.idx_dim <= 0 || s.idx_n_head <= 0)) ||
-        s.idx_block < 2 || s.page_size < 1) {
-        std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
-        std::exit(1);
-    }
-    if (s.n_head % s.n_head_kv != 0) {
-        std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who,
-                     (long long) s.n_head, (long long) s.n_head_kv);
-        std::exit(1);
-    }
-    if (s.head_dim % 4 != 0) {
-        std::fprintf(stderr, "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)\n", who,
-                     (long long) s.head_dim);
-        std::exit(1);
-    }
-    if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || (!dense && s.n_rot > s.idx_dim)) {
-        std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
-                     (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
-        std::exit(1);
-    }
-    if (s.idx_n_head > 32) {
-        std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
-                     (long long) s.idx_n_head);
+    char why[256];
+    if (!qsa_shapes_valid(s, why, sizeof why)) {
+        std::fprintf(stderr, "qsa: %s: %s\n", who, why);
         std::exit(1);
     }
 }
@@ -706,6 +683,38 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
 }
 
 // ================= host entry points =================
+
+bool qsa_shapes_valid(const QsaShapes& s, char* why, size_t why_len) {
+    auto no = [&](const char* msg) { if (why && why_len) std::snprintf(why, why_len, "%s", msg); return false; };
+    // dense attention (Qwen3.6, qsa_dense): the three indexer widths are zero TOGETHER; the KV, gather, attend and
+    // gate kernels do not read them.  Some of them zero is a half-set-up geometry (a builder that copied the
+    // geometry's two zeros and kept the sparse budget), refused rather than run as either model.
+    const bool dense = qsa_dense(s);
+    if (!dense && (s.idx_n_head == 0 || s.idx_dim == 0 || s.idx_top_k == 0)) {
+        if (why && why_len)
+            std::snprintf(why, why_len, "geometry is half set up: idx_n_head %lld, idx_dim %lld, idx_top_k %lld must be "
+                          "all zero (dense attention) or all set (the indexer)", (long long) s.idx_n_head,
+                          (long long) s.idx_dim, (long long) s.idx_top_k);
+        return false;
+    }
+    if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_block < 2 || s.page_size < 1)
+        return no("geometry is not set up");
+    if (s.n_head % s.n_head_kv != 0) {
+        if (why && why_len)
+            std::snprintf(why, why_len, "n_head %lld is not a multiple of n_head_kv %lld", (long long) s.n_head,
+                          (long long) s.n_head_kv);
+        return false;
+    }
+    if (s.head_dim % 4 != 0) return no("head_dim must be a multiple of 4 (the gather copies uint2)");
+    if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || (!dense && s.n_rot > s.idx_dim)) {
+        if (why && why_len)
+            std::snprintf(why, why_len, "n_rot %lld must be even and <= head_dim %lld and idx_dim %lld",
+                          (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
+        return false;
+    }
+    if (s.idx_n_head > 32) return no("idx_n_head > 32 (one warp per indexer head)");
+    return true;
+}
 
 void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s) {
     if (host_step == nullptr) return;

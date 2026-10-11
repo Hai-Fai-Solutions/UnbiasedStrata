@@ -87,6 +87,7 @@
 // The RAW tail is fp32 for the same reason and because it is only `idx_block - 1` rows.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -125,11 +126,17 @@ inline float qsa_rms_eps() { return 1e-6f; }
 inline double qsa_freq_base() { return 1e7; }
 
 /// DENSE attention (Qwen3.6-35B-A3B, docs/QWEN36-35B-A3B.md 3.3): the full-attention layers have no indexer, so
-/// every cell is selected every token.  The signal is `idx_n_head == 0` - "no indexer query heads" is what
-/// `ModelGeometry::idx_q_heads` says for a `qwen35moe` file, and every site that builds a `QsaShapes` copies it -
-/// so no caller has to remember a second flag.  Under it the selection width is `n_kv`, the capacity is the
-/// state's `max_cells` (`qsa_selection_cap`), and the attention kernels take a null `ids` as the identity.
-inline bool qsa_dense(const QsaShapes& s) { return s.idx_n_head == 0; }
+/// every cell is selected every token.  The signal is the three indexer widths ZERO TOGETHER, which is what the
+/// one builder (`strata/core/qsa_shapes.hpp`) writes for a geometry without an indexer; a shape with some of them
+/// zero is half set up and `qsa_shapes_valid` refuses it, so the same predicate decides here and in the kernels'
+/// guard.  Under it the selection width is `n_kv`, the capacity is the state's `max_cells` (`qsa_selection_cap`),
+/// and the attention kernels take a null `ids` as the identity.
+inline bool qsa_dense(const QsaShapes& s) { return s.idx_n_head == 0 && s.idx_dim == 0 && s.idx_top_k == 0; }
+
+/// What every kernel's geometry guard checks (`qsa.cu`'s `validate`, which exits on a refusal): the head counts,
+/// `n_rot`, the page size, and either a full indexer geometry or a dense one - never a half-set shape.  The test
+/// calls this; the kernels call the exiting form.
+bool qsa_shapes_valid(const QsaShapes& s, char* why, size_t why_len);
 
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`; `n_kv` itself for dense attention.
 ///
