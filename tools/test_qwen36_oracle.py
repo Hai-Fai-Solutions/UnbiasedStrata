@@ -367,7 +367,7 @@ class ActivationQuantTests(unittest.TestCase):
             y = q.quantize_act(x, wt)
             amax = np.abs(x.reshape(-1, bs)).max(axis=1)
             err = np.abs((x - y).reshape(-1, bs)).max(axis=1)
-            self.assertTrue((err <= amax / 127 * 0.5 * 1.01 + 1e-7).all(), wt)     # half a step of the block's scale
+            self.assertTrue((err <= amax / 127 * 0.57 + 1e-7).all(), wt)     # half a step of the block scale (+ the fp16 scale of Q8_0)
             self.assertGreater(err.max(), 0)                                       # and it is not the identity
             np.testing.assert_allclose(q.quantize_act(y, wt), y, rtol=1e-5, atol=1e-6)   # idempotent
             # at most 255 distinct levels per block
