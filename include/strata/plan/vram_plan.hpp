@@ -27,7 +27,9 @@ struct VramPlanInput {
     uint64_t drafter_bytes = 0;        ///< the MTP draft block: dense + experts in VRAM + ring KV + logits
     uint64_t kv_bytes_per_token = 0;   ///< the KV format's bytes per token over every attention layer
     uint64_t session_bytes = 0;        ///< rope table, GDN state, scratch
-    uint64_t cuda_context_bytes = 0;   ///< the driver's own share, ~230 to 300 MiB
+    uint64_t cuda_context_bytes = 0;   ///< the driver's own share, ~230 to 300 MiB, when `budget_bytes` is a card's
+                                       ///< size (the study's table); 0 when it is cudaMemGetInfo's free figure, which
+                                       ///< is read after the context exists and so is already net of it
     uint64_t reserve_bytes = 0;        ///< --vram-reserve-mib (700 default, 300 on a small card)
     uint64_t prompt_bytes = 0;         ///< the prompt path's chunk buffers; 0 when prefill borrows cache slots
     int64_t context = 262144;          ///< requested

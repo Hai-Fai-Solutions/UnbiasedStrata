@@ -2203,7 +2203,10 @@ int main(int argc, char** argv) {
                            (uint64_t) g.n_gdn_layers() * ((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                                           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * 4 +
                            (36ull << 20);
-        in.cuda_context_bytes = 300ull << 20;
+        // cudaMemGetInfo's free figure is read after this process's context exists, so the driver's share is
+        // already out of it: 0 here.  The planner's unit test puts the study's 300 MiB in, because its budgets are
+        // the cards' sizes (table 4.1), not a free figure.
+        in.cuda_context_bytes = 0;
         in.reserve_bytes = (uint64_t) (o.vram_reserve_given ? o.vram_reserve_mib : 300) << 20;   // kSmallReserveMib
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         in.prompt_bytes = (o.prefill_chunk > 0 && !borrow) ? ((uint64_t) (160 + (o.prefill_chunk * 680) / 1024) << 20) : 0;
