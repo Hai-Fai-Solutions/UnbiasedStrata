@@ -100,6 +100,16 @@ class Cfg:
         assert self.n_layer >= self.interval, "need at least one full-attention layer"
 
 
+def split_sections(sec: list, slots: int) -> list:
+    """Largest-remainder split of `slots` sector slots (n_rot / 2 of them) in the proportions of `sec`."""
+    tot = sum(sec)
+    raw = [s * slots / tot for s in sec]
+    fl = [int(x) for x in raw]
+    for i in sorted(range(len(sec)), key=lambda i: raw[i] - fl[i], reverse=True)[: slots - sum(fl)]:
+        fl[i] += 1
+    return fl
+
+
 def real_config(path: str) -> tuple[Cfg, dict]:
     """Derive a toy Cfg from a real qwen35moe GGUF: keep what is a rule (rope base, eps, interval, conv
     kernel, the ratios), divide what is a size.  Returns (cfg, report-of-real-values)."""
@@ -112,12 +122,7 @@ def real_config(path: str) -> tuple[Cfg, dict]:
     sec = list(g("rope.dimension_sections", [11, 11, 10, 0]))
     small_hd = hd // 8
     small_rot = n_rot * small_hd // hd
-    # largest-remainder split of n_rot/2 sector slots in the real proportions
-    tot = sum(sec)
-    raw = [s * (small_rot // 2) / tot for s in sec]
-    fl = [int(x) for x in raw]
-    for i in sorted(range(len(sec)), key=lambda i: raw[i] - fl[i], reverse=True)[: small_rot // 2 - sum(fl)]:
-        fl[i] += 1
+    fl = split_sections(sec, small_rot // 2)
     n_head, n_kv = g("attention.head_count"), g("attention.head_count_kv")
     cfg = Cfg(
         n_embd=g("embedding_length") // 32, n_layer=4, interval=g("full_attention_interval", 4),
@@ -314,6 +319,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--like-real", metavar="REAL.gguf", help="take rope/eps/interval/ratios and the tensor-name set from a real qwen35moe GGUF")
     ap.add_argument("--heads", metavar="N,KV", help="attention heads and KV heads (default 2,1; use 4,2 to make GQA non-degenerate)")
+    ap.add_argument("--head-dim", type=int, metavar="D", help="attention head_dim (default 32); n_rot becomes D/4, the IMRoPE sections the real "
+                    "[11,11,10,0] in proportion, rope base 1e7: 256 is the engine's kernel width (step 3's attention parity)")
     ap.add_argument("--no-nextn", action="store_true", help="omit the MTP block (the real UD-IQ3_XXS file has none)")
     ap.add_argument("--fused-gate-up", action="store_true", help="ffn_gate_up_exps instead of ffn_gate_exps + ffn_up_exps")
     ap.add_argument("--fused-qkv", action="store_true", help="attention layers carry attn_qkv instead of attn_q/k/v")
@@ -333,6 +340,9 @@ def main() -> int:
     c.seed = a.seed
     if a.heads:
         c.n_head, c.n_head_kv = (int(x) for x in a.heads.split(","))
+    if a.head_dim:
+        c.head_dim, c.n_rot, c.rope_base = a.head_dim, a.head_dim // 4, 1e7
+        c.rope_sections = tuple(split_sections([11, 11, 10, 0], c.n_rot // 2))
     if a.no_nextn:
         c.nextn = False
     c.fused_gate_up |= a.fused_gate_up
