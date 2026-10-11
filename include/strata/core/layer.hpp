@@ -277,6 +277,10 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
 int64_t qsa_kv_resident();
+/// Whether KV streaming applies to this geometry.  Dense attention (Qwen3.6, no indexer) reads every cell every
+/// token, so streaming would copy the whole KV over PCIe per token: false, with `why` for the CLI's refusal.
+/// `qsa_state_init` refuses the same way as a backstop.
+bool qsa_kv_streaming_applies(const ModelGeometry& g, std::string& why);
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.
 int64_t qsa_kv_resident_min();
