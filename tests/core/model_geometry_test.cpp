@@ -125,6 +125,46 @@ void qwen4exp() {
           "qwen4exp: the GDN and expert widths keep Flash-Next's defaults when the file has no key for them");
     check(strata::check_architecture(strata::GgufFile(p.string())).empty(), "qwen4exp passes the architecture guard");
 
+    // the real Flash-Next key set (the Q2 file's metadata: ssm.*, key_length, the interval, the expert widths, the
+    // rope keys): the reader's optional reads and its four refusals run on the working model's values and must land
+    // on the defaults field by field - this is the one path that could refuse the model the engine already serves
+    const fs::path full = d.path / "flash-full.gguf";
+    // (block_count 48 with no draft block: the guard's qwen4exp branch wants the literal 48, as it always did)
+    fixture::write(full, {fixture::str("general.architecture", "qwen4exp"), fixture::u32("qwen4exp.block_count", 48),
+                          fixture::u32("qwen4exp.embedding_length", 2560),
+                          fixture::u32("qwen4exp.expert_count", 512), fixture::u32("qwen4exp.expert_used_count", 10),
+                          fixture::u32("qwen4exp.attention.head_count", 24), fixture::u32("qwen4exp.attention.head_count_kv", 2),
+                          fixture::u32("qwen4exp.attention.key_length", 256), fixture::u32("qwen4exp.full_attention_interval", 4),
+                          fixture::u32("qwen4exp.ssm.conv_kernel", 4), fixture::u32("qwen4exp.ssm.state_size", 128),
+                          fixture::u32("qwen4exp.ssm.group_count", 16), fixture::u32("qwen4exp.ssm.time_step_rank", 48),
+                          fixture::u32("qwen4exp.ssm.inner_size", 6144), fixture::u32("qwen4exp.expert_feed_forward_length", 640),
+                          fixture::u32("qwen4exp.expert_shared_feed_forward_length", 640),
+                          fixture::u32("qwen4exp.rope.dimension_count", 64), fixture::u32s("qwen4exp.rope.dimension_sections", {11, 11, 10, 0}),
+                          fixture::f32("qwen4exp.rope.freq_base", 10000000.0f),
+                          fixture::f32("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6f)},
+                   {});
+    ModelGeometry gf;
+    const bool okf = read(full.string(), gf, err);
+    check(okf, "a qwen4exp file with the full key set reads" + (okf ? std::string() : ": " + err));
+    const ModelGeometry def;   // the struct's defaults are Flash-Next's
+    check(gf.arch == def.arch && gf.n_embd == def.n_embd && gf.n_layers == def.n_layers && gf.nextn_layers == 0 &&
+              gf.qsa_interval == def.qsa_interval && gf.n_vocab == def.n_vocab,
+          "full key set: n_embd, 48 trunk layers, the interval, n_vocab equal the defaults");
+    check(gf.ssm_state_size == def.ssm_state_size && gf.ssm_k_heads == def.ssm_k_heads && gf.ssm_v_heads == def.ssm_v_heads &&
+              gf.ssm_d_conv == def.ssm_d_conv && gf.ssm_conv_channels == def.ssm_conv_channels &&
+              gf.ssm_value_dim == def.ssm_value_dim,
+          "full key set: the GDN fields and the derived conv channels / value dim equal the defaults");
+    check(gf.n_head == def.n_head && gf.n_head_kv == def.n_head_kv && gf.head_dim == def.head_dim && gf.n_rot == def.n_rot &&
+              gf.rope_sections[0] == 11 && gf.rope_sections[1] == 11 && gf.rope_sections[2] == 10 && gf.rope_sections[3] == 0 &&
+              gf.rope_base == def.rope_base && std::fabs(gf.rms_eps - def.rms_eps) < 1e-12,
+          "full key set: the attention and rope fields equal the defaults");
+    check(gf.idx_q_heads == def.idx_q_heads && gf.idx_key_dim == def.idx_key_dim && gf.hc == def.hc && gf.hc_lr == def.hc_lr &&
+              gf.n_expert == def.n_expert && gf.n_expert_used == def.n_expert_used && gf.n_ff == def.n_ff &&
+              gf.n_ff_shexp == def.n_ff_shexp && gf.has_ple == def.has_ple && gf.has_indexer(),
+          "full key set: the indexer, hc, the MoE widths and the PLE equal the defaults");
+    const std::string guard_full = strata::check_architecture(strata::GgufFile(full.string()));
+    check(guard_full.empty(), "the full-key file passes the guard" + (guard_full.empty() ? std::string() : ": " + guard_full));
+
     // the guard and the reader refuse an unknown architecture by its name
     const fs::path q = d.path / "other.gguf";
     fixture::write(q, {fixture::str("general.architecture", "llama"), fixture::u32("llama.block_count", 32)}, {});
