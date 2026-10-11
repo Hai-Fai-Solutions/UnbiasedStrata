@@ -67,7 +67,7 @@ prints the census. The two real files:
 | File | Layers x experts | Expert bytes | Mean / largest blob | Per-layer formats |
 | --- | --- | ---: | ---: | --- |
 | `UD-IQ3_XXS` | 40 x 256 | 10,594 MiB (11,108,614,144 B) | 1.035 / 1.172 MiB | gate/up IQ2_S everywhere; down IQ3_XXS on 37 layers (blob 1,073,152 B), IQ4_XS on 34, 38, 39 (1,228,800 B) |
-| `UD-Q4_K_XL` (MTP repo) | 40 x 256 (+ `blk.40`, the drafter's, left out) | 18,726 MiB (19,636,158,464 B) | 1.829 / 2.195 MiB | gate/up Q4_K, down Q5_K on 37 layers (1,900,544 B); Q4_K / Q6_K on 34 and 38 (2,039,808 B); Q5_K / Q6_K on 39 (2,301,952 B) |
+| `UD-Q4_K_XL` (MTP repo) | 40 x 256 (+ `blk.40`, the drafter's, left out) | 18,726 MiB (19,635,634,176 B) | 1.829 / 2.195 MiB | gate/up Q4_K, down Q5_K on 37 layers (1,900,544 B); Q4_K / Q6_K on 34 and 38 (2,039,808 B); Q5_K / Q6_K on 39 (2,301,952 B) |
 
 These two files are `tests/data/native_experts/qwen36-{iq3_xxs,q4_k_xl}.txt` and `expert_layout_test` loads them
 at 2048 x 512 (every layer's `NativeFmt` makes the blob) and sees them refused at 2560 x 640. The full pack
@@ -105,9 +105,18 @@ On VM 211 (the 1080 Ti, sm_61; `docs/qwen36-port/pascal-build.md` has the build'
     ./build/unbiased-strata --engine --native /home/rk/models/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --pack /home/rk/packs/qwen36-iq3 \
         --tokens 1 --max-context 262144 --kv q4_0 --spec 4 --prefill 2048 --expert-profile /dev/null   # the gate
 
-(The VM section is filled in below once the baseline sweep running there has finished; the rules of the step
-forbid any build or run while `llama-server` or `sweep_ladder_1080ti.py` is alive.)
-
 ## 5. VM 211 results
 
-Pending the sweep.
+Done 2026-10-11 after the sweep and its nvprof re-runs released the card (`docs/qwen36-port/pascal-build.md` has
+every log line; the VM keeps the tree at `/home/rk/UnbiasedStrata-step2/` with `build/`, `build-make/` and `logs/`).
+
+| Item | Result |
+| --- | --- |
+| sm_61 build | no source change needed: configure 4 s, `unbiased-strata` 173 s, every other target 43 s more, 0 errors; `cuobjdump --list-elf` shows `sm_61` only. Every sm_75+ site was already behind `__CUDA_ARCH__` (pascal-build.md section 1) |
+| `make build CUDA_ARCHS=61` | end to end with no compiler override, 181 s, `sm_61` only; the Makefile's switch sets `STRATA_EXPERIMENTAL_SM60=ON` |
+| ctest on the 1080 Ti | 75 tests: 69 pass, 4 fail, 2 skip (sm_80 fused prompt MoE). Of the failures one is Pascal-specific, `kv_hybrid_parity` [5/5], where `qsa_prompt_attn_batch` refuses `cc < 70` by design and the test counts the refusal as a failure (step 3). The other three are the host: `platform_memory_test` (mlock limit 8 MiB), `ple_parity` (hardcoded Flash-Next path), `expert_multi_test` (AVX-512 on Zen 1). Two of the branch's own tests had never been built (CUDA-gated): `qwen36_synth_fixtures` failed under cmake 3.31 (CMP0007, commit `cd2a73c`) and `expert_layout_test` carried a wrong Q4 total and a refusal-message expectation (commit `5798a46`); both pass now, and `model_geometry_test --real` passes on the VM against both real files |
+| the pack | `native_experts.txt` only: 2,669 B in 0.35 s on the Mac for the IQ3_XXS file; 2,727 B in 0.6 s on the VM (vendored gguf-py) for the Q4_K_XL file |
+| the gate | **not reached.** Both real files print the geometry block and are then refused by the native expert kernel's format whitelist, before the plan: `layer 0's experts are IQ2_S/IQ3_XXS (ggml types 22/18), which this engine has no GPU kernels for` (exit 1, 0.13 s), and `Q4_K/Q5_K (12/13)` for the Q4 file. The grouped kernels' *down* types are IQ4_NL / IQ4_XS / Q5_0 / Q5_1 / Q8_0 only; the IQ3_XXS file's down is IQ3_XXS (37 layers), the Q4_K_XL's Q5_K and Q6_K. A step 3 kernel item (or a step 4 repack of the down projections) the plan did not list; the gate message itself is exercised by `model_geometry_test --real` |
+
+Correction to section 3's table: the Q4_K_XL expert total is 19,635,634,176 B (the pack header's figure, and the sum
+of its blobs); the earlier 19,636,158,464 was 524,288 B high and was also in `expert_layout_test`.
