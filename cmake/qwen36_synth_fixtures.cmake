@@ -3,6 +3,7 @@
 #   cmake -DPYTHON=<python3 with numpy> -DSOURCE_DIR=<repo> -DOUT=<dir> -P cmake/qwen36_synth_fixtures.cmake
 #
 # Exit 3 when numpy or the vendored gguf-py is missing (a trimmed third_party): the tests that need the files skip.
+cmake_policy(SET CMP0007 NEW)   # keep the empty flag of "toy.gguf;" (cmake < 4 drops it and list(GET 1) fails)
 file(MAKE_DIRECTORY "${OUT}")
 set(_tool "${SOURCE_DIR}/tools/qwen36_synth_gguf.py")
 foreach(_case "toy.gguf;" "toy-nonextn.gguf;--no-nextn" "toy-fused-gate-up.gguf;--fused-gate-up"
