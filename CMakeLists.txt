@@ -826,6 +826,32 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(qsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
 
+  # Qwen3.6 step 3 (docs/qwen36-port/step3-attn.md): dense attention through the split-K decode kernel and the
+  # prompt kernel - G templated (2, 8, 12), a null ids as the identity, the bounded scratch, the sparse width refused
+  # for the dense model - against a host reference in every KV format, and the oracle's attention seams on
+  # the synthetic fixtures at head_dim 256 (cmake/qwen36_attn_fixtures.cmake; skips without python3 + numpy)
+  add_executable(qsa_dense_parity src/kernels/qsa_dense_parity.cpp)
+  target_include_directories(qsa_dense_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qsa_dense_parity PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+  if(NOT _q36_python STREQUAL "")
+    add_test(NAME qwen36_attn_fixtures
+             COMMAND ${CMAKE_COMMAND} -DPYTHON=${_q36_python} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/qwen36_attn -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qwen36_attn_fixtures.cmake)
+    set_tests_properties(qwen36_attn_fixtures PROPERTIES FIXTURES_SETUP qwen36_attn_data)
+    add_test(NAME qsa_dense_parity COMMAND qsa_dense_parity --fixtures ${CMAKE_CURRENT_BINARY_DIR}/qwen36_attn)
+    set_tests_properties(qsa_dense_parity PROPERTIES FIXTURES_REQUIRED qwen36_attn_data SKIP_RETURN_CODE 77)
+  else()
+    add_test(NAME qsa_dense_parity COMMAND qsa_dense_parity)
+    set_tests_properties(qsa_dense_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # the decode attention's cost per call at a few depths (the before / after numbers of step3-attn.md); explicit
+  # ids only, so it builds against the kernel before step 3 as well
+  add_executable(qsa_attn_bench src/kernels/qsa_attn_bench.cpp)
+  target_include_directories(qsa_attn_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qsa_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME qsa_attn_bench COMMAND qsa_attn_bench --heads 16,2 --cells 2051,8192 --reps 10)
+  set_tests_properties(qsa_attn_bench PROPERTIES SKIP_RETURN_CODE 77)
+
   # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
   # kernel's reach, with tied and with equal scores (synthetic, no model)
   add_executable(qsa_topk_parity src/kernels/qsa_topk_parity.cpp)
