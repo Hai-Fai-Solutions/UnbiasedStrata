@@ -658,6 +658,9 @@ int main(int argc, char** argv) {
     // /health: ok or error, plus the engine's expert tiers and counters when it is between requests (STATS: VRAM
     // slots and how many hold an expert, RAM copies, mapped experts, tokens served, VRAM hits of lookups, RAM-copy
     // and file reads, warm hints, major page faults).  During a request the last reading is served, marked stale.
+    // httplib serves /health from several threads: the last reading has its own lock (engine.mu is the engine's,
+    // taken only to ask), and every read of it is a copy under that lock.
+    static std::mutex stats_mu;
     static std::string last_stats;
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = srv.engine.alive() ? 200 : 503;
@@ -666,13 +669,24 @@ int main(int argc, char** argv) {
             std::unique_lock<std::mutex> lk(srv.engine.mu, std::try_to_lock);
             if (lk.owns_lock()) {
                 std::string reply, err;
-                if (srv.engine.command("STATS", "STATS ", reply, err)) last_stats = reply.substr(6);
-                else if (last_stats.empty()) body += ",\"tiers_error\":\"" + err + "\"";
-                if (!last_stats.empty()) body += ",\"tiers\":" + last_stats;
-            } else if (!last_stats.empty()) {
-                body += ",\"tiers\":" + last_stats + ",\"tiers_stale\":true";
+                const bool got = srv.engine.command("STATS", "STATS ", reply, err);
+                lk.unlock();
+                std::string stats;
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu);
+                    if (got) last_stats = reply.substr(6);
+                    stats = last_stats;
+                }
+                if (!got && stats.empty()) body += ",\"tiers_error\":\"" + err + "\"";
+                if (!stats.empty()) body += ",\"tiers\":" + stats;
             } else {
-                body += ",\"busy\":true";
+                std::string stats;
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu);
+                    stats = last_stats;
+                }
+                if (!stats.empty()) body += ",\"tiers\":" + stats + ",\"tiers_stale\":true";
+                else body += ",\"busy\":true";
             }
         }
         body += "}";
