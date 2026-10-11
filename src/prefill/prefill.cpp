@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/core/qsa_shapes.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -704,11 +705,7 @@ int64_t primary_cells(const core::SessionState& ss) {
 // The attention shapes of this model.  A model without an indexer (Qwen3.6) zeroes the three indexer widths together:
 // that is the kernels' dense signal (qsa_dense; qsa.cu's guard refuses a shape with only some of them zero).
 strata::kernels::QsaShapes shapes_of(const core::ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    if (!g.has_indexer()) { s.idx_n_head = 0; s.idx_dim = 0; s.idx_top_k = 0; }
-    return s;
+    return strata::core::qsa_shapes(g);   // the one builder (strata/core/qsa_shapes.hpp), as layer, verify, mtp, session
 }
 // The capacity of the per-query selection buffers: the sparse width (2,051) with an indexer, every cell of the
 // context (the primary state's max_cells) for dense attention - qsa_selection_cap, as the attention branch defines
