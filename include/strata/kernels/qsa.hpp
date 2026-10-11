@@ -124,16 +124,29 @@ inline float qsa_rms_eps() { return 1e-6f; }
 /// constant is what that config's `freq_base` defaults to and what CLI `--rope-freq-base` overrides.
 inline double qsa_freq_base() { return 1e7; }
 
-/// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.
+/// DENSE attention (Qwen3.6-35B-A3B, docs/QWEN36-35B-A3B.md 3.3): the full-attention layers have no indexer, so
+/// every cell is selected every token.  The signal is `idx_n_head == 0` - "no indexer query heads" is what
+/// `ModelGeometry::idx_q_heads` says for a `qwen35moe` file, and every site that builds a `QsaShapes` copies it -
+/// so no caller has to remember a second flag.  Under it the selection width is `n_kv`, the capacity is the
+/// state's `max_cells` (`qsa_selection_cap`), and the attention kernels take a null `ids` as the identity.
+inline bool qsa_dense(const QsaShapes& s) { return s.idx_n_head == 0; }
+
+/// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`; `n_kv` itself for dense attention.
 ///
 /// The `r - 1 = 3` is not slack, it is the incomplete tail: the budget is whole blocks PLUS whatever cells do
 /// not fill one.  So the plan's "selection skipped when context <= 2,048" is conservative by two - the source's
 /// own bound is 2,051, and `ref/qsa.py` L292-294 records the disagreement.  Below the bound the selection is
 /// the IDENTITY, which `topk_512` is required to reproduce exactly rather than approximately.
 inline int64_t qsa_selection_width(int64_t n_kv, const QsaShapes& s) {
+    if (qsa_dense(s)) return n_kv;
     const int64_t w = s.idx_top_k + s.idx_block - 1;
     return n_kv < w ? n_kv : w;
 }
+
+/// The CAPACITY of every per-selection buffer (`ids`, the attention scratch, the gather scratch): the largest
+/// width a token can have.  Sparse: `qsa_selection_width(kTopkMaxCells, s)` = 2,051 (the number every caller used
+/// to spell out).  Dense: the state's `max_cells`, because the width is the context itself.
+int64_t qsa_selection_cap(int64_t max_cells, const QsaShapes& s);
 
 /// THE PER-TOKEN VALUES EVERY QSA KERNEL NEEDS, IN DEVICE MEMORY.
 ///
@@ -157,7 +170,7 @@ enum QsaStep : int {
     kStepPos = 0,     ///< the new cell's sequence position
     kStepNKv = 1,     ///< pos + 1: how many cells are in the cache
     kStepNBid = 2,    ///< n_kv / idx_block: how many blocks have COMPLETED
-    kStepWidth = 3,   ///< qsa_selection_width(n_kv, s): how many cells the selection returns
+    kStepWidth = 3,   ///< qsa_selection_width(n_kv, s): how many cells the selection returns (n_kv when dense)
     kStepCount = 4,
 };
 
@@ -280,6 +293,10 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
 /// ascending tie rule deterministic without a second pass over global memory.  Phase 3 replaces this with a
 /// radix select and Phase 7 raises the cap; until then a longer context is refused loudly.
 inline constexpr int64_t kTopkMaxCells = 32768;
+
+inline int64_t qsa_selection_cap(int64_t max_cells, const QsaShapes& s) {
+    return qsa_dense(s) ? max_cells : qsa_selection_width(kTopkMaxCells, s);
+}
 
 void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
               void* stream);
