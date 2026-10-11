@@ -83,6 +83,10 @@ FORM = {
     "indexer.k_norm.weight": "F32", "ple_norm_conv.weight": "F32", "ple_norm_key.weight": "F32",
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
+    # qwen35moe (Qwen3.6-35B-A3B, docs/QWEN36-35B-A3B.md 3.5): the plain residual's norms in place of the hc_* set.
+    # Stored F32 in every shipped file, so these are written as stored; its routers and ssm_alpha / ssm_beta are F32
+    # with non-BF16 values, so a Qwen3.6 pack takes --compat-bf16 (step 4 decides the engine's form for them).
+    "attn_norm.weight": "F32", "post_attention_norm.weight": "F32", "output_norm.weight": "F32",
 }
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
@@ -435,7 +439,19 @@ def expert_layout(model: Model, src: pathlib.Path):
     exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
+    fused = sorted(n for n in exps if n.endswith(".ffn_gate_up_exps.weight"))
+    if fused:
+        return ("%s: the experts are fused (llama.cpp's gate-then-up form); the engine reads separate "
+                "ffn_gate_exps / ffn_up_exps / ffn_down_exps tensors" % fused[0])
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+    # the MTP files (Qwen3.6 -MTP builds, blk.40) carry the draft block as the last block(s): its experts belong
+    # to the drafter's pack (step 4), not to the trunk's layout, or the engine would route layer 40 of a 40-layer model
+    meta = model.files[0].metadata
+    arch = meta.get("general.architecture", "")
+    nextn = int(meta.get("%s.nextn_predict_layers" % arch, 0) or 0)
+    if nextn:
+        n_layers -= nextn
+        print("%d draft (nextn) block(s) at blk.%d and up are left to the MTP pack; %d trunk layers" % (nextn, n_layers, n_layers))
     n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
     if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
@@ -501,6 +517,9 @@ def main() -> int:
                          "(rounds weights; leaves experts and the PLE table unchanged)")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
+    ap.add_argument("--layout-only", action="store_true",
+                    help="write native_experts.txt alone (the per-layer expert formats, blob sizes and offsets) and "
+                         "print the census: the pack-side check of a model file, nothing else is written")
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
@@ -522,6 +541,19 @@ def main() -> int:
         print(got)
         return 1
     layout, text, n_expert, offset = got
+    if a.layout_only:
+        (out / "native_experts.txt").write_text(text, encoding="utf-8")
+        kinds = {}
+        for l, gt, dt, off, blob, ts in layout:
+            kinds.setdefault((ts[0].type_name, ts[2].type_name, blob), []).append(l)
+        print("%s: %d layers x %d experts, %.0f MiB of experts, mean blob %.3f MiB, largest %.3f MiB" % (
+            src.name, len(layout), n_expert, offset / 2 ** 20, offset / n_expert / len(layout) / 2 ** 20,
+            max(b for *_, b, _ in layout) / 2 ** 20))
+        for (gu, dn, blob), ls in sorted(kinds.items(), key=lambda kv: kv[1][0]):
+            print("  gate/up %-8s down %-8s blob %9d B: %s" % (gu, dn, blob,
+                  "layers %s" % ls if len(ls) <= 8 else "%d layers" % len(ls)))
+        print("wrote %s" % (out / "native_experts.txt"))
+        return 0
     path = out / "experts.bin"
     sidecar = out / "experts.bin.src.json"
     want = experts_source(model, text, offset)

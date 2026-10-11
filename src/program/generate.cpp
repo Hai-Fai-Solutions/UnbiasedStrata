@@ -27,6 +27,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/model_geometry.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -2002,12 +2003,40 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
     }
+    // THE GEOMETRY, FROM THE MODEL FILE, BEFORE ANYTHING IS SIZED BY IT (Qwen3.6 port, step 2; docs/QWEN36-35B-A3B.md
+    // 3.8).  With --native the file is the authority on every field (strata/core/model_geometry.hpp reads the
+    // `<arch>.*` keys of the metadata shard; a pruned GSQ-RCO Coder's 256 experts, Qwen3.6's 2048 x 40 x 256 x top-8);
+    // without it the canonical Flash-Next defaults stand, as they always did for the Q2_0 pack.  `K` is the router's
+    // k from the same place.  Until this step only `expert_count` and `expert_used_count` were read, and after the
+    // expert layout below had already been checked against the defaults (geometry-inventory.md rows 7 to 10).
+    strata::core::ModelGeometry g;
+    if (!o.native_preset.empty()) {
+        if (!strata::core::read_model_geometry(o.native_shards.front(), g, err)) {
+            std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
+                         o.native_preset.c_str(), err.c_str());
+            return 1;
+        }
+        if (g.arch != strata::core::ModelArch::Qwen4Exp)
+            std::fprintf(stderr, "strata generate: model geometry (%s, from the file's metadata):\n%s",
+                         o.native_preset.c_str(), strata::core::model_geometry_text(g).c_str());
+        // the fused tensor layouts llama.cpp accepts and this engine refuses by name (no shipped file uses them)
+        try {
+            const strata::GgufModel model(o.native_shards);
+            if (!strata::core::check_model_tensor_forms(model, g, err)) {
+                std::fprintf(stderr, "strata generate: %s: %s\n", o.native_preset.c_str(), err.c_str());
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            return 1;
+        }
+    }
+    int64_t K = g.n_expert_used;
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g.n_layers, g.n_expert, g.n_embd, g.n_ff, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2070,8 +2099,6 @@ int main(int argc, char** argv) {
                              "(multi-token for the i-quant gate/up rows)\n",
                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
-    int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
     // (rope_scaling.hpp); the only hard constraint is "set before that", and dying on a bad rope key beats
@@ -2084,16 +2111,15 @@ int main(int argc, char** argv) {
         std::string gguf_rope_type;
         double gguf_rope_base = 0, gguf_rope_factor = 0, gguf_rope_orig_ctx = 0;
         if (!o.native_preset.empty()) {
-            // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
-            // is the authority on its own MoE shape - everything else in the geometry is unchanged
+            // the MoE shape and the rest of the geometry were read above (`g`, `K`); the rope keys are under the
+            // same architecture prefix (qwen4exp. or qwen35moe.)
             try {
                 strata::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
+                const std::string pre = std::string(strata::core::model_arch_name(g.arch)) + ".";
+                if (const strata::MetaValue* v = model_gguf.get(pre + "rope.freq_base")) gguf_rope_base = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(pre + "rope.scaling.type")) gguf_rope_type = v->s;
+                if (const strata::MetaValue* v = model_gguf.get(pre + "rope.scaling.factor")) gguf_rope_factor = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(pre + "rope.scaling.original_context_length"))
                     gguf_rope_orig_ctx = v->num();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
@@ -2181,9 +2207,8 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
+                               g.n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
