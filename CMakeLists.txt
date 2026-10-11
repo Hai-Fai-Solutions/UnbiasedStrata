@@ -231,6 +231,33 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # Qwen3.6 port, step 2: ModelGeometry from the model file's metadata (strata/core/model_geometry.hpp) on the
+  # synthetic qwen35moe GGUFs tools/qwen36_synth_gguf.py writes (python3 with numpy and the vendored gguf-py; the
+  # fixture test skips without them, and so does the test that needs the files)
+  add_executable(model_geometry_test tests/core/model_geometry_test.cpp)
+  target_link_libraries(model_geometry_test PRIVATE strata_artifact)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  set(_q36_python "")
+  foreach(_cand ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" /usr/bin/python3 python3)
+    if(_cand STREQUAL "" OR NOT _q36_python STREQUAL "")
+      continue()
+    endif()
+    execute_process(COMMAND ${_cand} -c "import numpy" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _q36_probe)
+    if(_q36_probe EQUAL 0)
+      set(_q36_python "${_cand}")
+    endif()
+  endforeach()
+  if(NOT _q36_python STREQUAL "")
+    add_test(NAME qwen36_synth_fixtures
+             COMMAND ${CMAKE_COMMAND} -DPYTHON=${_q36_python} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/qwen36_synth -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qwen36_synth_fixtures.cmake)
+    set_tests_properties(qwen36_synth_fixtures PROPERTIES FIXTURES_SETUP qwen36_synth_data)
+    add_test(NAME model_geometry_test COMMAND model_geometry_test ${CMAKE_CURRENT_BINARY_DIR}/qwen36_synth)
+    set_tests_properties(model_geometry_test PROPERTIES FIXTURES_REQUIRED qwen36_synth_data SKIP_RETURN_CODE 3)
+  else()
+    message(STATUS "STRATA tests: no python3 with numpy - the qwen36 synthetic fixtures and model_geometry_test are "
+                   "not registered")
+  endif()
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
