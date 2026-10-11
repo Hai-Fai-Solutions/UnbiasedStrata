@@ -177,12 +177,13 @@ attention wiring with the harness and its fixtures, the harness's chunk accounti
 What the integrator should know:
 
 - `src/kernels/cuda/qsa_decode_attn.cu`, `qsa_prompt_attn.cu`, `qsa.cu` and the two headers are the attention
-  branch's versions at 856daa0; rebasing onto that branch makes the cherry-picks empty.
-- The GDN branch adds `ModelGeometry::gdn_gate()` (`[shared]` 4f9aeb9) and the block branch changes `layout.cpp`
-  (`[shared]` 69d52c9: at hc = 1 the hc_* rows are not required and `attn_norm` / `post_attention_norm` are).  This
-  branch derives `Geom::silu` from `g.arch` directly; once `gdn_gate()` is in the tree that line can read it.  The
-  layout check is not called by the prompt path; `Prefill::run` reads the two norms through `need()` and refuses a
-  non-F32 one by name.
+  branch's versions at 856daa0; the decode GDN kernels and `gdn_parity.cpp` are the GDN branch's at 7954497;
+  rebasing onto the integration branch makes those cherry-picks empty.
+- The GDN branch's 7954497 (`kernels::GdnGate`, the decode kernels' gate argument) and 4f9aeb9 (`[shared]`
+  `ModelGeometry::gdn_gate()`) are cherry-picked here too: `GdnGeom::gate` is that enum, required with no default,
+  and `Geom::of` takes it from `g.gdn_gate()`, so the prompt and decode paths agree by construction (drop the two
+  at integration).  The block branch's `layout.cpp` change (`[shared]` 69d52c9) is not needed by the prompt path:
+  `Prefill::run` reads the two norms through `need()` and refuses a non-F32 one by name.
 - `WeightTable::set` is the only change outside `src/prefill`, `tests/cuda/prefill_*`, `tests/python`,
   `docs/qwen36-port` and the CMake lines that register the tests.
 

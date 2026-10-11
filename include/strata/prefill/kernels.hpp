@@ -5,6 +5,7 @@
 // the kernel walks the chunk's tokens in order inside one launch.
 #pragma once
 
+#include "strata/kernels/gdn.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
@@ -47,12 +48,14 @@ void residual_add(float* R, const float* bo, int64_t n, void* stream);
 
 // ---- GDN (state 128, 4 taps; the head geometry per model: Flash-Next 48 v heads / 16 k heads / 10240 conv
 // channels with the sigmoid(z) output gate, Qwen3.6 32 / 16 / 8192 with SiLU(z)).  The kernels are built for those
-// two geometries (gdn_geometry_supported); any other stops the process, as the kernels' convention is.
+// two geometries (gdn_geometry_supported); any other stops the process, as the kernels' convention is.  The gate is
+// the decode kernels' `GdnGate` (strata/kernels/gdn.hpp), from `ModelGeometry::gdn_gate()`: required, no default, so
+// the prompt path and the decode path agree by construction.
 struct GdnGeom {
-    int hv = 48;         ///< value heads (ssm_v_heads)
-    int hk = 16;         ///< key heads (ssm_k_heads); v-head h uses k-head h % hk
-    int c = 10240;       ///< conv channels: 2 * hk * 128 + hv * 128 (q | k | v)
-    bool silu = false;   ///< the output gate: SiLU(z) (Qwen3.6) instead of sigmoid(z) (Flash-Next)
+    int hv;                      ///< value heads (ssm_v_heads)
+    int hk;                      ///< key heads (ssm_k_heads); v-head h uses k-head h % hk
+    int c;                       ///< conv channels: 2 * hk * 128 + hv * 128 (q | k | v)
+    strata::kernels::GdnGate gate;   ///< the output gate: Silu (Qwen3.6) or Sigmoid (Flash-Next)
 };
 bool gdn_geometry_supported(int hv, int hk, int c);
 /// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, hv + h])  (ab: [T, 2 hv])

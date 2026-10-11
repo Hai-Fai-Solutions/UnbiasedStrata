@@ -991,8 +991,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     const cudaStream_t cs = (cudaStream_t) stream;
     gdn_dispatch(g, "gdn_recurrence", [&](auto tag) {
         constexpr int HV = decltype(tag)::HV, HK = decltype(tag)::HK, C = decltype(tag)::C;
+        const bool silu = g.gate == strata::kernels::GdnGate::Silu;
         if (serial || T <= 0) {
-            if (g.silu)
+            if (silu)
                 gdn_rec_kernel<HV, HK, C, true><<<HV, dim3(S, RG), 0, cs>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
             else
                 gdn_rec_kernel<HV, HK, C, false><<<HV, dim3(S, RG), 0, cs>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
@@ -1007,7 +1008,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
             gdn_rec_cols_pipe_kernel<HV, HK, C><<<HV * NCB, dim3(CB, RG), 0, cs>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<HV, HK, C><<<HV * NCB, dim3(CB, RG), 0, cs>>>(state, h, gate, beta, y, T);
-        if (g.silu) gdn_out_norm_kernel<HV, true><<<dim3((unsigned) T, HV), S, 0, cs>>>(z, gamma, eps, y, y16);
+        if (silu) gdn_out_norm_kernel<HV, true><<<dim3((unsigned) T, HV), S, 0, cs>>>(z, gamma, eps, y, y16);
         else gdn_out_norm_kernel<HV, false><<<dim3((unsigned) T, HV), S, 0, cs>>>(z, gamma, eps, y, y16);
     });
     check("gdn_recurrence");

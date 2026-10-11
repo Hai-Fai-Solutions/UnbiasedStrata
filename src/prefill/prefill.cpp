@@ -100,7 +100,7 @@ struct Geom {
     int64_t nh = 24, nkv = 2, hd = 256;          ///< attention heads, KV heads, head dim
     int64_t qf = 24 * 512, av = 6144, kvw = 512; ///< attn_q's width (q | gate per head), n_head * 256, n_head_kv * 256
     bool indexer = true;                         ///< the QSA indexer (Flash-Next); Qwen3.6's attention is dense
-    bool silu = false;                           ///< the GDN output gate: SiLU(z) (Qwen3.6) instead of sigmoid(z)
+    strata::kernels::GdnGate gate = strata::kernels::GdnGate::Sigmoid;   ///< the GDN output gate (ModelGeometry::gdn_gate)
     static Geom of(const core::ModelGeometry& g) {
         Geom o;
         o.n = g.n_embd; o.hc = g.hc; o.d = g.hc * g.n_embd; o.lr = g.hc_lr;
@@ -109,10 +109,10 @@ struct Geom {
         o.nh = g.n_head; o.nkv = g.n_head_kv; o.hd = g.head_dim;
         o.qf = g.n_head * 2 * g.head_dim; o.av = g.n_head * g.head_dim; o.kvw = g.n_head_kv * g.head_dim;
         o.indexer = g.has_indexer();
-        o.silu = g.arch == core::ModelArch::Qwen35Moe;
+        o.gate = g.gdn_gate();
         return o;
     }
-    GdnGeom gdn() const { return GdnGeom{(int) hv, (int) hk, (int) c, silu}; }
+    GdnGeom gdn() const { return GdnGeom{(int) hv, (int) hk, (int) c, gate}; }
 };
 // The largest expert count any pack has (the peer path's event ring and host bounds are sized once from it).
 constexpr int64_t NE_MAX = 512;

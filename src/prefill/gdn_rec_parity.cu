@@ -971,7 +971,7 @@ int check_reference(int64_t T, uint64_t seed) {
     float* y = dalloc<float>(n);
     uint16_t* y16 = dalloc<uint16_t>(n);
     ck(cudaMemcpy(state, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state");
-    const strata::prefill::GdnGeom geom{HV, HK, C, SILU};
+    const strata::prefill::GdnGeom geom{HV, HK, C, SILU ? strata::kernels::GdnGate::Silu : strata::kernels::GdnGate::Sigmoid};
     strata::prefill::gdn_recurrence(state, in.h, in.gate, in.beta, in.z, in.gamma, 1e-6f, y, y16, T, geom, nullptr);
     ck(cudaDeviceSynchronize(), "gdn_recurrence");
     std::vector<uint16_t> hy16(n);
@@ -1020,7 +1020,7 @@ int check_conv(int64_t T, uint64_t seed) {
     ck(cudaMemcpy(hq.data(), qkv, hq.size() * 4, cudaMemcpyDeviceToHost), "qkv");
     ck(cudaMemcpy(hw.data(), w, hw.size() * 4, cudaMemcpyDeviceToHost), "w");
     ck(cudaMemcpy(hh.data(), hist, hh.size() * 4, cudaMemcpyDeviceToHost), "hist");
-    const strata::prefill::GdnGeom geom{HV, HK, C, HV == 32};
+    const strata::prefill::GdnGeom geom{HV, HK, C, HV == 32 ? strata::kernels::GdnGate::Silu : strata::kernels::GdnGate::Sigmoid};
     strata::prefill::gdn_conv(hist, qkv, w, h, T, 1e-6f, geom, nullptr);
     ck(cudaDeviceSynchronize(), "gdn_conv");
     std::vector<float> eh((size_t) T * C), ehist((size_t) C * 3);
