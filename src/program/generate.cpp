@@ -124,10 +124,14 @@ bool under_wddm() {
 // would size it), and a blocker of `total - cap` is allocated at start (main, before the weight arena), so the driver
 // is under the pressure the real card would be under.  0 = no cap.
 int64_t g_vram_cap_bytes = 0;
+uint64_t g_vram_blocker_bytes = 0;   // the blocker's own allocation, which `used` below must not count twice
 cudaError_t vram_info(size_t* free_b, size_t* total_b) {
     const cudaError_t e = cudaMemGetInfo(free_b, total_b);
     if (e == cudaSuccess && g_vram_cap_bytes > 0 && *total_b > 0) {
-        const uint64_t used = *total_b > *free_b ? *total_b - *free_b : 0;   // this process AND every other one
+        // this process AND every other one, minus the blocker: the blocker already took `total - cap` out of
+        // `free`, so counting it in `used` as well subtracted it twice (room went negative at --vram-cap 5722)
+        const uint64_t all = *total_b > *free_b ? *total_b - *free_b : 0;
+        const uint64_t used = all > g_vram_blocker_bytes ? all - g_vram_blocker_bytes : 0;
         const uint64_t room = (uint64_t) g_vram_cap_bytes > used ? (uint64_t) g_vram_cap_bytes - used : 0;
         if (*free_b > room) *free_b = (size_t) room;
     }
@@ -2132,12 +2136,24 @@ int main(int argc, char** argv) {
                 return 1;
             }
             g_vram_cap_bytes = (int64_t) cap;
+            g_vram_blocker_bytes = hold;
             size_t f2 = 0, t2 = 0;
             vram_info(&f2, &t2);
+            // what a card of `cap` would show free with the same other programs on it; the driver may round the
+            // blocker up by a few MiB, so the figure is a bound, not an identity
+            const uint64_t expect = cap > used ? cap - used : 0;
             std::fprintf(stderr, "strata generate: --vram-cap %lld MiB: %llu MiB of this %llu MiB card held back; %llu MiB "
-                                 "free to this engine (the other %llu MiB were in use before it started)\n",
+                                 "free to this engine (the other %llu MiB were in use before it started; a %llu MiB card "
+                                 "would show %llu)\n",
                          (long long) o.vram_cap_mib, (unsigned long long) (hold >> 20), (unsigned long long) (total_b >> 20),
-                         (unsigned long long) (f2 >> 20), (unsigned long long) (used >> 20));
+                         (unsigned long long) (f2 >> 20), (unsigned long long) (used >> 20), (unsigned long long) (cap >> 20),
+                         (unsigned long long) (expect >> 20));
+            if (f2 > expect || expect - f2 > (64ull << 20)) {
+                std::fprintf(stderr, "strata generate: --vram-cap: the free figure after the blocker is %llu MiB, not the "
+                                     "%llu MiB a card of the cap would have: the clamp is wrong\n",
+                             (unsigned long long) (f2 >> 20), (unsigned long long) (expect >> 20));
+                return 1;
+            }
         }
     }
     // --ram-cap: the RAM tier (--resident-*) and the pinned arena see at most this much host memory
