@@ -31,9 +31,12 @@ constexpr int WARPS = THREADS / 32;
 // capacity up to 8,192 is the old kernel exactly - one sub-chunk per block, the same grid, the same arithmetic.
 constexpr int kMaxChunks = 128;
 
-__host__ __device__ __forceinline__ int chunks_for(long long cap) {
+// The bound applies to DENSE shapes only.  A sparse (Flash-Next) shape keeps one block per 64 cells at any
+// capacity - its states cap at 2,051, but the MTP drafter's ring runs this kernel at its --mtp-window (32,768 by
+// default, 512 blocks) and must keep its previous grid, scratch and summation order bit for bit.
+__host__ __device__ __forceinline__ int chunks_for(long long cap, bool dense) {
     const long long c = (cap + CHUNK - 1) / CHUNK;
-    return (int) (c < kMaxChunks ? c : kMaxChunks);
+    return (int) (dense && c > kMaxChunks ? kMaxChunks : c);
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -442,11 +445,12 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
-// The single-chunk form of the kernel above: PR #540's body as it was, with G and the null-ids identity.  A state
-// whose capacity is at most kMaxChunks x 64 = 8,192 cells (every Flash-Next state: cap 2,051) runs THIS one, so
-// Flash-Next's Pascal path is the old kernel to the instruction (the looped form costs 16-28 registers on sm_61 and
-// 15% on the Q4_0 pool at 2,051 cells; capping the registers spilled and cost more).  The looped form above runs
-// only for a capacity past 8,192, i.e. the dense model's long-context states.
+// The single-chunk form of the kernel above: PR #540's body as it was, with G and the null-ids identity.  Every
+// sparse (Flash-Next) shape runs THIS one at any capacity, and a dense state of at most kMaxChunks x 64 = 8,192
+// cells too, so Flash-Next's Pascal path - the QSA layers at cap 2,051 and the MTP drafter's ring at its window -
+// is the old kernel to the instruction (the looped form costs 16-28 registers on sm_61 and 15% on the Q4_0 pool at
+// 2,051 cells; capping the registers spilled and cost more).  The looped form above runs only for the dense model's
+// states past 8,192 cells.
 template <int KV_MODE, int G>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75_single(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
@@ -657,7 +661,7 @@ bool pre75_attn() {
     }
     return cc[dev] < 75;
 }
-#define STRATA_ATTN_CHUNK(M, G) (pre75_attn() ? (n_chunks < kMaxChunks ? attn_chunk_kernel_pre75_single<M, G> : attn_chunk_kernel_pre75<M, G>) : attn_chunk_kernel<M, G>)
+#define STRATA_ATTN_CHUNK(M, G) (pre75_attn() ? (!dense || n_chunks < kMaxChunks ? attn_chunk_kernel_pre75_single<M, G> : attn_chunk_kernel_pre75<M, G>) : attn_chunk_kernel<M, G>)
 #else
 #define STRATA_ATTN_CHUNK(M, G) attn_chunk_kernel<M, G>
 #endif
@@ -670,7 +674,8 @@ template <int G>
 void launch_group(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                   const QsaShapes& s, float* scratch, float* attn, int64_t n_q, cudaStream_t st) {
     const int kv_mode = kv_mode_of(pools);
-    const int n_chunks = chunks_for(cap);
+    const bool dense = qsa_dense(s);
+    const int n_chunks = chunks_for(cap, dense);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
@@ -753,10 +758,10 @@ bool qsa_attn_group_check(const QsaShapes& s, int G, char* why, size_t why_len) 
     return true;
 }
 
-int64_t qsa_decode_attn_chunks(int64_t cap) { return chunks_for(cap); }
+int64_t qsa_decode_attn_chunks(int64_t cap, const QsaShapes& s) { return chunks_for(cap, qsa_dense(s)); }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
-    return (uint64_t) chunks_for(cap) * (uint64_t) s.n_head * (HD + 2) + 64;
+    return (uint64_t) chunks_for(cap, qsa_dense(s)) * (uint64_t) s.n_head * (HD + 2) + 64;
 }
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,

@@ -17,9 +17,11 @@
 // `qsa_attn_group` picks it from the geometry and refuses any other ratio by name); a NULL `ids` is the identity
 // selection, cell j = j for j < step[kStepWidth], which is dense attention without an ids buffer (prefill at
 // 2,048 queries x 262,144 cells would otherwise carry 2 GiB of ids); and the number of blocks per KV head is
-// capped at 128 so the split-K partials are bounded at 2.02 MiB per query row (16 heads) instead of growing to
-// 64.5 MiB at 262,144 cells - each block walks its share of the selection in 64-cell sub-chunks with an online
-// rescale, computed from the token's width on the device, so a short selection keeps one block per 64 cells.
+// capped at 128 FOR DENSE SHAPES so the split-K partials are bounded at 2.02 MiB per query row (16 heads) instead
+// of growing to 64.5 MiB at 262,144 cells - each block walks its share of the selection in 64-cell sub-chunks with
+// an online rescale, computed from the token's width on the device, so a short selection keeps one block per 64
+// cells.  A sparse shape keeps one block per 64 cells at any capacity: the QSA layers (cap 2,051) and the MTP
+// drafter's ring (its window, 32,768 by default) run the previous grid, scratch and summation order.
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
@@ -48,11 +50,14 @@ int qsa_attn_group(const QsaShapes& s, char* why, size_t why_len);
 /// is refused here by name, never run mis-indexed (the negative test of docs/QWEN36-35B-A3B.md section 6, step 3).
 bool qsa_attn_group_check(const QsaShapes& s, int G, char* why, size_t why_len);
 
-/// Blocks per KV head for `cap` cells: `min(ceil(cap / 64), 128)`.  The scratch holds one partial per block.
-int64_t qsa_decode_attn_chunks(int64_t cap);
+/// Blocks per KV head for `cap` cells: `ceil(cap / 64)` for a sparse shape (the kernel before Qwen3.6, at any
+/// capacity: the MTP drafter's ring runs it at its window), `min(ceil(cap / 64), 128)` for a dense one.  The scratch
+/// holds one partial per block.
+int64_t qsa_decode_attn_chunks(int64_t cap, const QsaShapes& s);
 
-/// Scratch floats per query row for `cap` selected cells: `chunks(cap) * n_head * 258 + 64` (partial
-/// accumulators, maxima and sums).  Bounded: 528,448 floats (2.02 MiB) at 16 heads for any cap >= 8,192.
+/// Scratch floats per query row for `cap` selected cells: `chunks(cap, s) * n_head * 258 + 64` (partial
+/// accumulators, maxima and sums).  Dense: bounded at 528,448 floats (2.02 MiB) at 16 heads for any cap >= 8,192.
+/// Sparse: the previous formula, unchanged.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
 /// `ids` (cap,) i32 or NULL for the identity selection (every cell up to step[kStepWidth]).

@@ -18,6 +18,7 @@
 // Exit 0 pass, 1 fail, 77 skip (no CUDA device, or --fixtures given and the fixtures are missing).
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/model_geometry.hpp"
+#include "strata/core/qsa_shapes.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -289,8 +290,33 @@ void section_dispatch() {
     verdict("qsa_step_fill writes width = n_kv for the dense shape", st[k::kStepWidth] == 3000 && st[k::kStepNKv] == 3000);
     k::qsa_step_fill(st, 2999, sparse);
     verdict("... and 2,051 for the sparse one", st[k::kStepWidth] == 2051);
-    verdict("chunks: 2,051 cells -> 33 blocks (the old grid), 8,192 -> 128, 262,144 -> 128",
-            k::qsa_decode_attn_chunks(2051) == 33 && k::qsa_decode_attn_chunks(8192) == 128 && k::qsa_decode_attn_chunks(262144) == 128);
+    verdict("dense chunks: 2,051 cells -> 33 blocks (the old grid), 8,192 -> 128, 262,144 -> 128",
+            k::qsa_decode_attn_chunks(2051, s16) == 33 && k::qsa_decode_attn_chunks(8192, s16) == 128 && k::qsa_decode_attn_chunks(262144, s16) == 128);
+    verdict("sparse chunks are the old grid at any capacity: 2,051 -> 33, 32,768 (the MTP drafter's window) -> 512",
+            k::qsa_decode_attn_chunks(2051, sparse) == 33 && k::qsa_decode_attn_chunks(32768, sparse) == 512 &&
+            k::qsa_decode_attn_scratch_floats(32768, sparse) == 512ull * 24 * 258 + 64);
+    // the one builder (strata/core/qsa_shapes.hpp) from a qwen35moe geometry, and the half-set shape it prevents
+    {
+        strata::core::ModelGeometry g;
+        g.arch = strata::core::ModelArch::Qwen35Moe; g.hc = 1; g.hc_lr = 0; g.has_ple = false;
+        g.n_head = 16; g.n_head_kv = 2; g.head_dim = 256; g.idx_q_heads = 0; g.idx_key_dim = 0;
+        g.ssm_v_heads = 32; g.n_expert = 256; g.n_expert_used = 8; g.n_ff = 512; g.n_layers = 40; g.derive();
+        const k::QsaShapes built = strata::core::qsa_shapes(g);
+        verdict("qsa_shapes(qwen35moe geometry) is dense: idx_n_head, idx_dim, idx_top_k all 0, n_rot 64, idx_block 4",
+                k::qsa_dense(built) && built.idx_top_k == 0 && built.n_rot == 64 && built.idx_block == 4 && built.n_head == 16);
+        why[0] = 0;
+        verdict("... and the kernels' guard accepts it", k::qsa_shapes_valid(built, why, sizeof why), why);
+        strata::core::ModelGeometry f;   // Flash-Next's defaults: the sparse shape, unchanged
+        const k::QsaShapes fn = strata::core::qsa_shapes(f);
+        verdict("qsa_shapes(qwen4exp geometry) is the sparse real shape (24 / 2, idx 4 x 128, top-k 2048)",
+                !k::qsa_dense(fn) && fn.idx_n_head == 4 && fn.idx_dim == 128 && fn.idx_top_k == 2048 && k::qsa_shapes_valid(fn, why, sizeof why));
+        k::QsaShapes half = k::qsa_real_shapes();   // what a hand-written builder made: two zeros, the budget kept
+        half.n_head = 16; half.idx_n_head = 0; half.idx_dim = 0;
+        why[0] = 0;
+        const bool refused = !k::qsa_shapes_valid(half, why, sizeof why);
+        verdict("NEGATIVE: the half-set shape (idx_n_head 0, idx_dim 0, idx_top_k 2048) is neither dense nor valid",
+                !k::qsa_dense(half) && refused && std::strstr(why, "half set up"), why);
+    }
     const uint64_t old2051 = 33ull * 24 * 258 + 64, new262k = 128ull * 16 * 258 + 64;
     verdict("scratch at cap 2,051 x 24 heads is the old formula (33 x 24 x 258 + 64 floats)",
             k::qsa_decode_attn_scratch_floats(2051, s24) == old2051);
