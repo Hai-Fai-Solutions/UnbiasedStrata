@@ -4,6 +4,8 @@ BUILD_DIR  ?= build
 CUDA_ARCHS ?= 86;89;120
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
+# extra CMake options for the configure step, for example CMAKE_ARGS=-DSTRATA_MMQ_KQUANTS=ON
+CMAKE_ARGS ?=
 
 .PHONY: build clean
 
@@ -13,7 +15,7 @@ build:
 	@git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>/dev/null || \
 	  git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
-	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)"
+	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(CMAKE_ARGS)
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target unbiased-strata
 	@echo "built: $(BUILD_DIR)/unbiased-strata"
 

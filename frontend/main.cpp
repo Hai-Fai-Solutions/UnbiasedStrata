@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -39,8 +40,6 @@ int strata_engine_main(int argc, char** argv);
 
 namespace {
 
-const char* const kModelName = "qwen3.8-flash-next-iq3_xxs";
-
 struct Options {
     std::string model;                  // shard 1 of the GGUF
     std::string pack;                   // the prepared pack directory
@@ -57,7 +56,7 @@ struct Options {
 void usage() {
     std::fprintf(stderr,
         "usage: unbiased-strata --model SHARD1.gguf --pack DIR --mtp DIR [options] [-- engine options]\n\n"
-        "  --model PATH    the model's first GGUF shard (...-00001-of-00002.gguf); the second must be beside it\n"
+        "  --model PATH    the model's first GGUF shard (...-00001-of-0000N.gguf); the other shards must be beside it\n"
         "  --pack DIR      the prepared pack for that model\n"
         "  --mtp DIR       the prepared draft head\n"
         "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
@@ -73,6 +72,14 @@ void usage() {
 bool file_exists(const std::string& p) {
     struct stat st;
     return ::stat(p.c_str(), &st) == 0;
+}
+
+/// The model name the API reports: the base name of the first shard up to "-00001-of-", in lower case.
+std::string model_name(const std::string& shard1) {
+    std::string name = shard1.substr(shard1.rfind('/') + 1);
+    name.resize(std::min(name.size(), name.rfind("-00001-of-")));
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    return name;
 }
 
 // ---------------------------------------------------------------------------------------------------- the engine
@@ -133,6 +140,7 @@ struct Prepared {
 
 struct Server {
     Options opt;
+    std::string model_name;
     Engine engine;
     strata_frontend::Vision vision;
     llama_model* model = nullptr;
@@ -421,7 +429,7 @@ struct Server {
             out["id"] = id;
             out["object"] = "chat.completion";
             out["created"] = created;
-            out["model"] = kModelName;
+            out["model"] = model_name;
             out["choices"] = common_json::array();
             out["choices"].push_back(choice);
             out["usage"] = usage_json(r);
@@ -442,7 +450,7 @@ struct Server {
                 out["id"] = id;
                 out["object"] = "chat.completion.chunk";
                 out["created"] = created;
-                out["model"] = kModelName;
+                out["model"] = model_name;
                 out["choices"] = common_json::array();
                 out["choices"].push_back(choice);
                 if (done) { out["usage"] = usage_json(*done); out["timings"] = timings_json(*done); }
@@ -580,15 +588,14 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
 
     // every file the engine needs must already be here: nothing is fetched
-    std::string shard2 = o.model;
-    const size_t at = shard2.rfind("-00001-of-00002");
-    if (at == std::string::npos) {
-        std::fprintf(stderr, "unbiased-strata: --model must be the first shard (...-00001-of-00002.gguf)\n");
+    if (o.model.find("-00001-of-") == std::string::npos) {
+        std::fprintf(stderr, "unbiased-strata: --model must be the first shard (...-00001-of-0000N.gguf); "
+                             "the other shards must be beside it\n");
         return 2;
     }
-    shard2.replace(at, 15, "-00002-of-00002");
+    srv.model_name = model_name(o.model);
     const std::string profile = o.pack + "/expert-profile.bin";
-    for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
+    for (const std::string& f : {o.model, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
                                  o.mtp + "/draft_vocab.bin"})
         if (!file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
@@ -598,7 +605,7 @@ int main(int argc, char** argv) {
     }
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
     std::vector<std::string> eargs = {
-        "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model, "--ple-gguf", shard2,
+        "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
         "--mtp", o.mtp, "--max-context", std::to_string(o.ctx), "--ple-io", "ram"};
     if (!o.mmproj.empty()) eargs.push_back("--vision");
@@ -652,7 +659,7 @@ int main(int argc, char** argv) {
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         if (!srv.engine.alive()) return json_error(res, 503, "the engine is not running", "server_error");
         common_json m = common_json::object();
-        m["id"] = kModelName;
+        m["id"] = srv.model_name;
         m["object"] = "model";
         m["owned_by"] = "local";
         m["context_length"] = srv.opt.ctx;
