@@ -320,9 +320,14 @@ struct Server {
 
     /// Runs one request.  The text produced so far is parsed by llama.cpp's chat parser after every token, and
     /// `emit` gets what changed (reasoning, answer text, tool-call pieces); it returns false when the client has
-    /// gone.  `final_msg` is the whole parsed message.
+    /// gone.  `final_msg` is the whole parsed message.  `keepalive`, when given, is called whenever 15 s pass
+    /// without an emit (content and tool calls are published only once the message is complete, so a long answer
+    /// is silent for minutes): the stream writes an SSE comment, which keeps clients with an idle timeout (pi:
+    /// 5 minutes) attached and notices a client that has gone, so the generation is cancelled instead of
+    /// running to the end for nobody.
     GenResult run(const Prepared& p, common_chat_msg& final_msg,
-                  const std::function<bool(const std::vector<common_chat_msg_diff>&)>& emit) {
+                  const std::function<bool(const std::vector<common_chat_msg_diff>&)>& emit,
+                  const std::function<bool()>& keepalive = {}) {
         std::lock_guard<std::mutex> lk(engine.mu);
         std::fprintf(stderr, "unbiased-strata: request %s start: prompt=%zu header=%s\n",
                      p.request_id.c_str(), p.ids.size(), p.header.c_str());
@@ -330,6 +335,7 @@ struct Server {
         common_chat_msg msg;
         std::vector<std::string> call_ids;
         bool client_ok = true;
+        auto last_write = std::chrono::steady_clock::now();
         auto update = [&](bool partial) {
             common_chat_msg now;
             try {
@@ -354,7 +360,10 @@ struct Server {
             now.set_tool_call_ids(call_ids, [] { return "call_" + make_id().substr(9); });
             const std::vector<common_chat_msg_diff> diffs = common_chat_msg_diff::compute_diffs(msg, now);
             msg = now;
-            if (client_ok && !diffs.empty()) client_ok = emit(diffs);
+            if (client_ok && !diffs.empty()) {
+                client_ok = emit(diffs);
+                last_write = std::chrono::steady_clock::now();
+            }
         };
         GenResult r = engine.generate(p.header, p.ids, [&](llama_token id) {
             if (llama_vocab_is_eog(vocab, id)) return client_ok;
@@ -364,6 +373,13 @@ struct Server {
                 text.append(pending, 0, n);
                 pending.erase(0, n);
                 update(true);
+            }
+            if (client_ok && keepalive) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_write >= std::chrono::seconds(15)) {
+                    client_ok = keepalive();
+                    last_write = now;
+                }
             }
             return client_ok;
         });
@@ -479,6 +495,10 @@ struct Server {
                     if (d.size() == 0) continue;
                     ok = ok && chunk(d, nullptr, nullptr);
                 }
+                return ok;
+            }, [&]() {
+                static const std::string ka = ": keepalive\n\n";   // an SSE comment: every client ignores it
+                ok = ok && sink.write(ka.data(), ka.size());
                 return ok;
             });
             if (ok) {
