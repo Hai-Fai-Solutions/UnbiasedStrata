@@ -137,12 +137,9 @@ plan like a small one.
 The 24 GB row is measured; the others are the planner's figures from the same files under `--vram-cap`
 (docs/qwen36-port/step2-notes.md section 5, step4-pack.md section 5).
 
-**RAM is part of the hierarchy, not a convenience.** The engine is fast when every expert the card does not hold
-is pinned in RAM, and it is disk-bound when they are not: measured on the GTX 1080 Ti at Q4_K_XL, 262,144
-context, the same point decodes at 52 tokens/s with the expert set in RAM and at 12 to 15 tokens/s under a 12 GiB
-memory bound, where about 12 experts per token come off the NVMe (llama.cpp does 13.4 there). IQ3_XXS fits the
-two tiers on that card and keeps 56 tokens/s under the same bound. What the host must hold is the expert bytes
-minus the card's share, plus the engine's own 3 to 4 GB and the OS:
+**RAM is a requirement, not a tier.** The engine assumes the card and the host RAM together hold the expert set;
+every expert the card does not hold is pinned in RAM. What the host must hold is the expert bytes minus the card's
+share, plus the engine's own 3 to 4 GB and the OS:
 
 | VRAM | Q4_K_XL experts off the card | RAM to have | IQ3_XXS experts off the card | RAM to have |
 | --- | --- | --- | --- | --- |
@@ -152,8 +149,9 @@ minus the card's share, plus the engine's own 3 to 4 GB and the OS:
 | 8 GB | 15 GB | 32 GB | 7 GB | 16 GB |
 | 6 GB | 17 GB | 32 GB | 9 GB | 16 GB |
 
-Below those figures the engine still starts (it maps the rest from the file and says so in its plan), but the
-decode rate is the disk's.
+Below those figures the engine still starts, maps the rest from the file and says so in its plan, but that is a
+fallback, not a supported configuration: measured once on the GTX 1080 Ti at Q4_K_XL under a 12 GiB memory bound,
+decode fell from 52 tokens/s to 12 to 15, the NVMe's rate, with about 12 experts per token read from the file.
 
 ## Status
 
