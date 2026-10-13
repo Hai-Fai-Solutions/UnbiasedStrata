@@ -146,6 +146,56 @@ struct Prepared {
     long long max_new = 0;
 };
 
+/// The parse of one response as its text grows: what has been published, and what to publish next.
+///
+/// Reasoning and answer text are published as they arrive.  Tool calls are published once, from the parse of the
+/// complete message: while a call is being written its arguments are partial JSON that the parser closes and
+/// normalizes on every token, so text already parsed can change (an escape, a number still being written), and
+/// an OpenAI stream cannot take back what it sent.  The same rule keeps the answer text sound: a partial parse
+/// whose content does not extend what was published (the parser reread the tail as the start of a tool call)
+/// publishes nothing for the content until it does.  This changes delivery, never generated tokens.
+struct StreamParse {
+    common_chat_msg msg;                // what has been published
+    std::vector<std::string> call_ids;
+
+    std::vector<common_chat_msg_diff> step(const std::string& text, bool partial, const common_chat_parser_params& parser) {
+        common_chat_msg now;
+        try {
+            now = common_chat_parse(text, partial, parser);
+        } catch (const std::exception&) {
+            if (partial) return {};                             // not parseable yet: wait for more text
+            now = common_chat_msg();
+            now.role = "assistant";
+            now.content = text;
+        }
+        now.content_parts.clear();
+        if (partial) {
+            now.tool_calls.clear();
+            if (now.content.compare(0, msg.content.size(), msg.content) != 0) now.content = msg.content;
+            if (now.reasoning_content.compare(0, msg.reasoning_content.size(), msg.reasoning_content) != 0)
+                now.reasoning_content = msg.reasoning_content;
+        } else {
+            // the complete parse decides; text it no longer holds was already sent and stays sent (the parser
+            // trims the white space before a tool call, which the partial parses still carried)
+            for (auto field : {&common_chat_msg::content, &common_chat_msg::reasoning_content}) {
+                const std::string& sent = msg.*field;
+                std::string& whole = now.*field;
+                if (whole.compare(0, sent.size(), sent) == 0) continue;
+                if (sent.compare(0, whole.size(), whole) != 0)
+                    std::fprintf(stderr, "unbiased-strata: the complete message's %s differs from the %zu bytes "
+                                         "already streamed; the stream keeps what it sent\n",
+                                 field == &common_chat_msg::content ? "content" : "reasoning", sent.size());
+                whole = sent;
+            }
+        }
+        if (now.empty()) return {};
+        now.set_tool_call_ids(call_ids, [] { return "call_" + make_id().substr(9); });
+        std::vector<common_chat_msg_diff> diffs = common_chat_msg_diff::compute_diffs(msg, now);
+        msg = now;
+        return diffs;
+    }
+};
+
 struct Server {
     Options opt;
     Engine engine;
@@ -328,11 +378,11 @@ struct Server {
     }
 
     /// Runs one request.  The text produced so far is parsed by llama.cpp's chat parser after every token, and
-    /// `emit` gets what changed (reasoning, answer text, tool-call pieces); it returns false when the client has
-    /// gone.  `final_msg` is the whole parsed message.  `keepalive`, when given, is called whenever 15 s pass
-    /// without an emit (content and tool calls are published only once the message is complete, so a long answer
-    /// is silent for minutes): the stream writes an SSE comment, which keeps clients with an idle timeout (pi:
-    /// 5 minutes) attached and notices a client that has gone, so the generation is cancelled instead of
+    /// `emit` gets what changed (reasoning and answer text as they grow, tool calls once the message is complete:
+    /// see StreamParse); it returns false when the client has gone.  `final_msg` is the whole parsed message.
+    /// `keepalive`, when given, is called whenever 15 s pass without an emit (a long tool call is silent while
+    /// its arguments are written): the stream writes an SSE comment, which keeps clients with an idle timeout
+    /// (pi: 5 minutes) attached and notices a client that has gone, so the generation is cancelled instead of
     /// running to the end for nobody.
     GenResult run(const Prepared& p, common_chat_msg& final_msg,
                   const std::function<bool(const std::vector<common_chat_msg_diff>&)>& emit,
@@ -341,34 +391,12 @@ struct Server {
         std::fprintf(stderr, "unbiased-strata: request %s start: prompt=%zu header=%s\n",
                      p.request_id.c_str(), p.ids.size(), p.header.c_str());
         std::string text, pending;
-        common_chat_msg msg;
-        std::vector<std::string> call_ids;
+        StreamParse parse;
+        common_chat_msg& msg = parse.msg;
         bool client_ok = true;
         auto last_write = std::chrono::steady_clock::now();
         auto update = [&](bool partial) {
-            common_chat_msg now;
-            try {
-                now = common_chat_parse(text, partial, p.parser);
-            } catch (const std::exception&) {
-                if (partial) return;                            // not parseable yet: wait for more text
-                now = common_chat_msg();
-                now.role = "assistant";
-                now.content = text;
-            }
-            // Partial tool JSON is reparsed and normalized as tokens arrive.
-            // Escapes and incomplete arguments can change already-parsed text,
-            // which cannot be retracted from an OpenAI stream. Publish content
-            // and tool calls once, after the full message is parsed; reasoning
-            // can still stream. This changes delivery, never generated tokens.
-            if (partial) {
-                now.content.clear();
-                now.content_parts.clear();
-                now.tool_calls.clear();
-            }
-            if (now.empty()) return;
-            now.set_tool_call_ids(call_ids, [] { return "call_" + make_id().substr(9); });
-            const std::vector<common_chat_msg_diff> diffs = common_chat_msg_diff::compute_diffs(msg, now);
-            msg = now;
+            const std::vector<common_chat_msg_diff> diffs = parse.step(text, partial, p.parser);
             if (client_ok && !diffs.empty()) {
                 client_ok = emit(diffs);
                 last_write = std::chrono::steady_clock::now();
@@ -381,7 +409,7 @@ struct Server {
             if (n > 0) {
                 text.append(pending, 0, n);
                 pending.erase(0, n);
-                update(true);
+                if (p.stream) update(true);                     // a whole response is parsed once, at the end
             }
             if (client_ok && keepalive) {
                 const auto now = std::chrono::steady_clock::now();
