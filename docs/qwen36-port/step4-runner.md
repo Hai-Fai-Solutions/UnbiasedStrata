@@ -128,26 +128,55 @@ qwen36_block_test, prefill_qwen36, native_expert_parity): **100% of 33 tests pas
 skipped, it needs the real-file STRATA_QWEN36_GGUF / _PACK env).  Every step-3 parity target and both new runner
 tests pass; the Flash-Next geometry's parity is unchanged.
 
-### VM 211, the GTX 1080 Ti (sm_61)
+### VM 211, the GTX 1080 Ti (sm_61), 2026-10-11 21:38-21:42 UTC
 
-Not run: the card's lock `/home/rk/VM-BUSY` was held by sibling agents the whole session (`qwen36-step3`, then
-`qwen36-step4-drafter`), each with nothing running on the card.  A lock is never removed by a writer who did not set
-it; the drafter was asked for a window.  Everything the runner adds on the GPU is a block-per-row reduction, an
-elementwise add and the existing verify kernels, all of which step 3 already ran on sm_61, so the 1080 Ti pass is a
-rebuild-and-run, not new kernel risk.
+Run after the notes above were first written, once the card's lock freed (held by sibling agents with nothing
+running; released 21:34).  Tree `/home/rk/qwen36-step4-runner`, logs `/home/rk/logs/step4-runner-*.log`.
+
+- Configure (the common line, `-DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=61`) and an incremental
+  build from the pack tree's objects: 3 min 4 s, 0 errors.
+- `qwen36_verify_test`: PASS, 0 failures.  `result_output_all` per position (40): worst rel L2 F32 5.65e-02, Q8
+  3.46e-02 (gate Q8 <= 5e-02); argmax equals the Q8 oracle's at 40 of 40, the F32 oracle's at 37 of 40 (the same
+  three near ties, positions 1, 4, 23, as on the 4090).
+- `qwen36_runner_check.py`: PASS, 0 failures.  c7 worst rel L2 F32 2.05e-02 / Q8 2.55e-02; c40 2.32e-02 / 2.26e-02;
+  ar (positions 1..39) 4.35e-02 / 4.37e-02, argmax 36 of 36 unambiguous; c7 vs c40 rows 35..39 rel L2 1.32e-02; c7
+  vs ar 2.12e-02; the 4 KB mutation of `blk.1.ffn_gate_inp.weight` moves the logits by rel L1 2.05e-01.
+- The real-file comparison against llama.cpp (three prompts, IQ3_XXS) did **not** run: the teacher fixtures
+  (`/home/rk/qwen36-step4-teacher/<prompt>/prompt_ids.txt`, `eng/*.f32`) were never synced to VM 211, so all three
+  engine runs exit 2 on "invalid token id" and the comparisons on a missing file.  Owed to step 5 along with the Q4
+  fit at 11 GB; the card has since been taken by another service (section 5).
+
+### VM 221, round 8 (2026-10-11 21:41 UTC): the drafter's VRAM term and the speculation rate
+
+`vram_plan_test` with the drafter's whole share (its K/V over the context, the draft head subset, the ids): all
+passed.  The real drafter (`--mtp`, 4-token windows, 64 greedy tokens on the `iq3-test20` prompt, `--prefill 2048
+--max-context 8192 --kv fp16 --expert-cache auto --suffix-draft 0`):
+
+| file, draft pack | drafts accepted | tokens per round | drafting ms/round | drafter VRAM | decode tok/s |
+| --- | --- | --- | --- | --- | --- |
+| IQ3_XXS, `qwen36-mtp-draft-full` | 44 of 57 (0.772) | 3.20 | 2.30 | 524 MiB | 317 |
+| IQ3_XXS, `qwen36-mtp-draft` (subset head) | 43 of 60 (0.717) | 3.05 | 1.38 | 695 MiB | 326 |
+| Q4_K_XL (plain file), `qwen36-mtp-draft` | 40 of 75 (0.533) | 2.54 | 1.54 | 745 MiB | 246 |
+| IQ3_XXS, no `--mtp` (one-token windows) | - | 1.00 | - | 0 | 112 (1 token) |
+
+The Q4 file's lower acceptance is expected: the draft pack comes from the Q4_K_XL-MTP file's `blk.40`, drafted
+against the plain Q4_K_XL trunk; the drafter notes (step4-drafter.md) measured 77% teacher-forced on the MTP file
+itself.  Logs `/models/work/logs/spec-*.log`, `r8-vram-plan-test.log`.
 
 ## 5. Not done, surprises
 
-- **The 1080 Ti pass** of steps 2-4 is not done: the card's lock was held by sibling agents all session (section 4);
-  the drafter agent was asked for a window and the integrator was told.  It is a rebuild-and-run when the card frees.
-- **The Q4 fit at 11 GB** was not measured (same lock); the Q4 run above is the 4090's.  The pack notes
+- **The 1080 Ti pass** of steps 2-4 ran at 21:38 (section 4): build, verify test and runner check pass; the
+  llama.cpp real-file comparison is owed (fixtures never synced).  Since 2026-10-12 22:04 UTC the card runs another
+  session's Flash-Next coder service (`unbiased-strata.service`, 10.9 GB, 100% busy) and is off limits.
+- **The Q4 fit at 11 GB** was not measured (the same lock, then the service); the Q4 run above is the 4090's.  The pack notes
   (step4-pack.md section 5) record the plan on the 11 GB card (Q4_K_XL fixed set 4,461 MiB, 34% of slots resident),
   so a reduced-context Q4 run there is the remaining 1080 Ti item.
 - **The chat template** (`make test-chat-parser MODEL=<gguf>`): on Qwen3.6's template a tool call whose required
-  parameter is not written first is silently dropped (0 tool calls), the failure the Qwen3-Coder any-argument-order
-  patch exists to prevent; the patch does not cover this template.  Measured: `path` first or alone parses, `limit
-  offset path` and `offset path limit` give 0.  The test aborts at `chat_parser_test.cpp:65`.  Filed REGINA-104;
-  the study assigns the chat template to step 5, so it is reported, not fixed here.
+  parameter is not written first was silently dropped (0 tool calls).  Filed REGINA-104.  Resolved at integration
+  (e73adc6): the template does route to the Qwen3-Coder parser the any-argument-order patch covers; the patch was
+  simply never applied, because only `make build` applied it and every VM tree was configured with cmake directly on
+  a copied submodule.  CMake now applies it at configure time; with the rebuilt `libllama-common` the test passes on
+  VM 221 for all four orders.
 - **The argmax near ties.** On the synthetic 40-token `base_ar` case the F32 and Q8 oracles disagree at 3 positions
   (1, 4, 23); the engine matches the Q8 oracle at all 40.  A position where the two references disagree cannot
   discriminate the engine, so the tests gate against the Q8 oracle and report those positions.
