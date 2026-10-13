@@ -136,7 +136,114 @@ provider `openai-completions` at the engine through an SSH tunnel, Q4_K_XL no ca
 21 of 21.  `make test-frontend` and `make test-chat-parser` pass.  The engine is untouched by these two commits, so
 no logits comparison was owed.
 
-**Seen, not chased.**  The same greedy request does not always generate the same number of tokens on one server
-(check b, thinking on, Q4 no cap: 632 tokens in one pass, 1,179 in the next, both read from token 0); with 260
-experts off the card the miss path (CPU or DMA) depends on timing.  Whether that is the whole reason is open.
+**Seen, then chased.**  The same greedy request does not always generate the same tokens on one server (check b,
+thinking on, Q4 no cap: 632 tokens in one pass, 1,179 in the next).  Traced in the next section: not a fault.
 Images (mmproj) were out of scope.
+
+## The same greedy request, different tokens: which paths differ, and by how much
+
+2026-10-13, VM 221, binary `11da5388afdfabcb`.  The engine was driven on its own stdin protocol (`unbiased-strata
+--engine --serve ...` with the front end's arguments, `GEN <max_new> <ids>`), so the record is token ids.  Two
+prompts from A5, rendered by the front end: `think` (26 tokens, "What is 2+2? Answer, then write three sentences
+about addition.", thinking on) and `nothink` (25 tokens, the lighthouse request, thinking off), `max_new` 3,000.
+Material in `/models/work/serve/nd-20261013/` (`nd.py` the driver, `cmp.py`, `trdiff.py`, `acc.py`, one `.jsonl` of
+token ids and one engine log per run, 23 GB of logit dumps).
+
+**Verdict: benign.**  No state leaks between requests.  The output is a pure function of the request and of which
+of three numerically different, individually correct paths each number went through; two things move a request
+between those paths from one pass to the next:
+
+1. **Where an expert is computed.**  A resident expert and one read over PCIe (DMA) run the GPU kernel (llama.cpp's
+   CUDA arithmetic: activations as Q8_1); a miss computed on the CPU runs ggml's CPU kernel (activations as Q8_K).
+   The two round differently, as llama.cpp's own CPU and CUDA back ends do.  The adaptive tier (`--adapt-every`, 4
+   rounds) swaps routed-but-missing experts into VRAM and keeps them across requests, so the second pass of a
+   request finds experts on the card that the first computed on the CPU.  It settles: once the cache stops
+   changing the output stops changing.
+2. **How the prompt's state was built.**  A part of at most `--short-read` (64) tokens and everything a checkpoint
+   or the live session supplies went through the verify windows; a longer part read from token 0 goes through the
+   batched prompt path, which is different arithmetic (step4-runner.md: the two agree to 2.1e-2 on the fixture).
+   Restoring a checkpoint is exact; what differs is a state made by decode against the same state re-read in a batch.
+
+With misses present a third input reaches the output through (1): the lookup drafter's policy picks window sizes
+from measured round times, the adaptive tier counts rounds, and the PCIe share of a layer's misses is a fraction
+of the misses in that window.  With `--suffix-draft 0` a fresh engine gave the same tokens with and without the
+tracing below (which slows every window); with the default it gave 557, 554 and 555 tokens for `think`.  With
+every expert resident the window shape does not reach the output (the window is bitwise independent of its shape).
+
+**Which configurations repeat.**  Ten requests of each prompt, alternating, on one engine unless noted:
+
+| configuration | misses run on | distinct outputs, `think` / `nothink` | tokens generated |
+| --- | --- | --- | --- |
+| IQ3_XXS, 262,144, q4_0, no cap (10,240 resident) | - | 1 / 1 | 480 / 197 |
+| the same, `think` alone 10 times (21 of 26 reused) and with `--prompt-cache 0` | - | 1, the same tokens | 480 |
+| Q4_K_XL, 8,192, fp16 (10,240 resident) | - | 1 / 1 | 664 / 218 |
+| Q4, 8,192, `--expert-cache 8000 --pcie-frac 1.0`, adaptive tier on or off | GPU (DMA) | 1 / 1, **the all-resident tokens** | 664 / 218 |
+| Q4, 8,192, `--expert-cache 8000 --pcie-frac 0.0 --adapt-every 0` | CPU, fixed set | 1 / 1 | 632 / 191 |
+| the same with the adaptive tier | CPU, changing set | 7 / 6, the same from the 7th request | 511, 557, 639, 633, 1,451, 478, 479 x 4 |
+| Q4, 262,144, q4_0, no cap (9,980 slots): the A5 configuration | CPU (0.05% of lookups) | 3 / 3, the same from the 3rd | 557, 620, 553 x 8 / 221, 213, 214 x 8 |
+| the same, `--prompt-cache 0` | CPU | the tokens of the row above | |
+| the same, `--adapt-every 0` | CPU, fixed set | 1 / 1 | 558 / 211 |
+| the same, `--suffix-draft 0` | CPU | 2 / 3 | 550, 551 x 9 |
+| the same, `--mtp-max-t 1 --suffix-draft 0` (6 requests) | CPU | 4 / 2 | 561, 552, 1,014, 552 x 3 |
+| the same, a new engine for every request | CPU | 1 / 1 | 557 / 196 |
+
+Every configuration with one path is bit-repeatable; the only ones that are not have CPU misses and a cache that
+is still changing.  The checkpoint cache, the drafter and the lookup drafter are not sources.  The second cause,
+with every expert resident (IQ3 no cap; Q4 at 8,192), one engine against a new engine reading from token 0:
+
+| request | state from | tokens | first difference |
+| --- | --- | --- | --- |
+| 258-token prompt, three times | 0 reused, then 253 reused + 5 | identical, and identical to a new engine | - |
+| `think`, its 480 / 664 generated tokens and a second user turn (529 / 713) | the live session (505 / 690 reused) or the header checkpoint (524 / 708) | identical to each other | |
+| the same on a new engine | the batched prompt path, all of it | IQ3 554 against 495, Q4 437 against 401 | token 191 / 140 |
+| a 73-token second turn | 21 reused + 52 through the windows, or 68 reused | identical to each other | |
+| the same on a new engine | 73 read from 0 | IQ3 890 against 494, Q4 465 against 438 | token 61 / 61 |
+
+**The margins where they part, and the accuracy of every state.**  `STRATA_SERVE_LOGIT_TRACE=FILE` (new, off by
+default) writes the head's five largest logits, the window and its misses per emitted token, and
+`STRATA_SERVE_LOGIT_DUMP=PREFIX` the whole row (the last window's rows past the stop token included);
+`tools/qwen36_teacher_llama.cpp` grew `--prompt-ids` and `--force-ids`, so llama.cpp (F16 K/V, the 4090) is
+teacher-forced along each run's own tokens and every position of every run is scored, with the path that run took.  Margins are logit differences between the two tokens chosen.
+
+| first difference | this pass | the other pass | llama.cpp |
+| --- | --- | --- | --- |
+| Q4 no cap, `think`, request 1 against 2, token 249 | 0.03 for A | 0.23 for B | 0.16 for B |
+| request 1 against 3, token 245 | 0.10 for A | 0.78 for B | 0.09 for B |
+| request 3 against 4, token 531 | 0.007 for A | 0.20 for B | 0.31 for B (its own pick is a third token, 0.12 above B) |
+| IQ3 no cap, session state against a batched re-read, token 191 | 0.27 | 0.34 | 0.03 |
+| Q4 8,192, the same, token 140 | 0.08 | 0.03 | 0.012 |
+| IQ3 / Q4 second turn, windows against batched, token 61 | 0.09 / 0.11 | 0.37 / 0.08 | 0.32 / 0.03 |
+
+Over the common prefix two passes differ by a mean of 0.12-0.13 logits on the reference's 20 largest (KL 1.4e-3
+to 2.1e-3 between them), the size of each pass's distance from llama.cpp.  Every state against llama.cpp, the
+whole run and its first 64 positions (the rule: 62 of 64, mean KL below 1e-2):
+
+| run, path | positions | top-1 | mean KL | max KL | first 64: top-1, mean KL |
+| --- | --- | --- | --- | --- | --- |
+| Q4 8,192 fp16, all resident (serve) | 664 | 660 (99.4%) | 8.3e-4 | 0.077 | 64, 5.6e-4 |
+| Q4 8,192, CPU misses, `--expert-cache 8000`, fixed (0.7% of lookups) | 632 | 624 (98.7%) | 8.9e-4 | 0.053 | 64, 5.5e-4 |
+| Q4 8,192, CPU misses, `--expert-cache 4000`, fixed (33% of lookups) | 547 | 542 (99.1%) | 8.9e-4 | 0.046 | 64, 1.3e-3 |
+| Q4 no cap 262,144 q4_0, requests 1 / 2 / 3 / 4 of `think` | 555 / 630 / 557 / 553 | 98.4 / 98.4 / 98.7 / 98.6% | 3.4e-3 / 3.3e-3 / 4.0e-3 / 3.8e-3 | 0.08 / 0.30 / 0.16 / 0.13 | 63, 1.8e-3 to 2.1e-3 |
+| IQ3 no cap 262,144 q4_0, second turn: session state / batched re-read | 495 / 554 | 98.8 / 99.3% | 3.4e-3 / 4.7e-3 | 0.11 / 0.10 | 64, 1.4e-3 / 64, 1.0e-3 |
+| IQ3, 73-token second turn: windows / batched | 494 / 890 | 98.2 / 98.5% | 4.1e-3 / 4.0e-3 | 0.15 / 0.14 | 62, 3.5e-3 / 63, 1.4e-3 |
+| Q4 8,192, second turn: session state / batched re-read | 401 / 437 | 99.8 / 99.3% | 9.4e-4 / 8.1e-4 | 0.023 / 0.033 | 64, 2.5e-4 / 64, 2.0e-4 |
+| Q4 8,192, 73-token second turn: windows / batched | 438 / 465 | 99.3 / 99.4% | 9.0e-4 / 1.5e-3 | 0.021 / 0.12 | 64, 8.3e-4 / 63, 6.2e-4 |
+| `strata --teacher-force`, 400 tokens of the all-resident run: resident / DMA / CPU 8000 / CPU 4000 / CPU 4000 fixed | 400 | 393 / 393 / 396 / 396 / 395 | 9.2e-4 / 9.2e-4 / 9.6e-4 / 7.9e-4 / 8.8e-4 | 0.028 to 0.036 | 63 or 64, 3.6e-4 to 5.9e-4 |
+
+Every top-1 disagreement with llama.cpp in these runs (113 in 9,912 positions) sits where llama.cpp's own margin is
+under 0.75 logits; one position in 20 to 25 has a top-2 gap under 0.5, so a greedy run of 500 tokens meets some
+twenty places where a pass can turn.  The teacher-forced resident and DMA dumps are the same bytes (`cmp`).  No
+rising drift: Spearman(position, KL) is between 0.00 and +0.13 in every run but the IQ3 batched re-read (+0.20, KL
+3.2e-3 in its first half and 6.1e-3 in its second).
+The 262,144 rows carry the q4_0 K/V against llama.cpp's F16 (mean KL 3-5e-3 where the fp16 rows have 8e-4 to
+1.5e-3); the K/V format is the likely reason (not isolated here), and it is in every pass alike.
+
+**For a run that must repeat.**  `--pcie-frac 1.0` (every miss on the GPU: the all-resident tokens whatever the
+cache holds, at the DMA path's cost), or `--adapt-every 0 --suffix-draft 0` (the miss set fixed, no timed policy).
+A conversation that continues on one engine still differs from the same prompt read from token 0 on another.
+
+**Not checked.**  The 1080 Ti (VM 211, off limits); a capped Q4 or IQ3 with thousands of misses per request beyond
+the `--expert-cache 4000` rows; sampled (temperature above 0) requests; requests cancelled mid-generation followed
+by the same prompt; the q4_0 K/V's own share of the 262,144 rows' KL.  `--teacher-force` with `--mtp` committed
+the drafter's guesses as if they were the oracle's tokens (70 of 400 top-1 on a run that scores 394 without it): it
+is now refused.
