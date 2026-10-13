@@ -124,6 +124,13 @@ Constraints across the ladder:
 
 ## 2. Models, the memory hierarchy, and the budget table the engine must reproduce at start
 
+**Decision 2026-10-13 (step 5, the user):** the hierarchy is two tiers, VRAM plus host RAM, assumed to hold the
+expert set; spilling to the NVMe is out of scope.  Measured on the 1080 Ti at Q4_K_XL: 52 tok/s with the set
+pinned in the VM's 35 GB, 12 to 15 tok/s under a 12 GiB bound (disk-bound, the replay's prediction; llama.cpp
+13.4).  The README states the RAM a card needs per quantization; the 12 GiB rows below are kept as the measured
+cost of breaking the assumption, not as a supported rung.  H6 and the disk-read instruments are therefore
+informational.
+
 **The hierarchy on the primary rung is three tiers, by the user's decision:** 11 GB of VRAM in the 1080 Ti,
 about 12 GiB of VM RAM (roughly 9 to 10 GB usable for a pinned expert tier after the OS, the process and
 the KV), then the VM's NVMe disk for the rest. Strata already has the pieces: the VRAM expert cache, the
