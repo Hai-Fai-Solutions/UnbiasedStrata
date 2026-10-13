@@ -247,3 +247,88 @@ the `--expert-cache 4000` rows; sampled (temperature above 0) requests; requests
 by the same prompt; the q4_0 K/V's own share of the 262,144 rows' KL.  `--teacher-force` with `--mtp` committed
 the drafter's guesses as if they were the oracle's tokens (70 of 400 top-1 on a run that scores 394 without it): it
 is now refused.
+
+## A5 on the 1080 Ti: the serving checks at the branch head
+
+2026-10-13, VM 211 (GTX 1080 Ti 11,264 MiB, sm_61, 14 vCPU, 52 GB; the box was free), tree at 542b53b (the streaming
+fix c3b41cc, `preserve_thinking` 3aa9eed, the logit diagnostics c7825b4), built by `/home/rk/build-step4.sh`:
+`unbiased-strata` sha256 `4e161358c8fd20c1`, `strata` `a44d896ccb25ff98`.  The ladder on this card was measured with
+7ebc9e5 (`e6c8bbf4cfb16e09`); the engine source differs from it by the diagnostics and the `--teacher-force --mtp`
+refusal only (`generate.cpp`, 52 lines).  Material: `/home/rk/bench/a5-1080ti-20261013/` (`logits/`, one `.json`,
+`.log`, `.summ.txt` per configuration, `speed/`), drivers `/home/rk/bench/a5-1080ti-job1a.sh` and `job1b.sh` there.
+
+**Tests.**  `ctest -R "qwen36|vram_plan_test|pool_native_widths_test"` on the free card: 21 of 21 (668 s).
+
+**The accuracy rule on this binary** (teacher-forced logits against llama.cpp's, `tools/qwen36_compare_logits.py`,
+fixtures `/home/rk/qwen36-step4-teacher`, the command of the REGINA-108 check: context 8,192, `--kv fp16`, `--spec 4
+--suffix-draft 0`, 64 positions; pass = top-1 at least 62 and mean KL below 1e-2).  Every miss forced onto one path:
+`--pcie-frac 0.0` the CPU pool, `1.0` DMA with the GPU computing.  `auto` holds 8,061 of 10,240 slots for IQ3 and
+4,240 for Q4 on this card; `--expert-cache 2000` holds 2,263 and 2,399.  Cells are top-1 of 64, mean KL; **bold**
+misses the rule.
+
+| fixture | auto, CPU misses | auto, DMA | 2000, CPU misses | 2000, DMA | the 4090, all resident |
+| --- | --- | --- | --- | --- | --- |
+| iq3-test20 | 64, 1.3e-3 | 63, 9.1e-4 | 64, 1.4e-3 | 64, 8.0e-4 | 64, 1.1e-3 |
+| iq3-task-prime-add-test | 64, 4.5e-3 | **64, 1.26e-2** | 64, 4.8e-3 | **63, 1.18e-2** | 64, 6.6e-3 |
+| iq3-task-psim-collide | 64, 2.3e-3 | 64, 2.1e-3 | 64, 2.0e-3 | 64, 2.0e-3 | 64, 1.9e-3 |
+| q4-test20 | 62, 6.0e-3 | **61**, 8.5e-3 | **61**, 8.3e-3 | **62, 1.17e-2** | 61, 7.4e-3 |
+| q4-task-prime-add-test | 64, 8.1e-4 | 64, 1.2e-3 | 64, 1.1e-3 | 64, 7.2e-4 | 64, 1.7e-3 |
+| q4-task-psim-collide | 64, 1.3e-3 | 64, 7.0e-4 | 64, 1.3e-3 | 64, 7.7e-4 | 64, 4.2e-4 |
+
+**19 of 24 runs pass; 5 do not, all on two fixtures** (REGINA-111).  Not a regression of this binary, and not broad:
+
+- the CPU column at `auto` is the REGINA-108 post-fix table again (1.4e-3 / 4.8e-3 / 2.0e-3, q4-test20 62 at 6e-3,
+  q4-prime-add 8e-4), and q4-test20 `auto` DMA has the pre-fix binary's figures to the last printed digit (61, 0.00845,
+  0.13765 at position 8): neither path moved;
+- each miss is one position.  q4-test20: positions 8, 9, 13, the near ties where the 4090 with every expert resident
+  also reads 61 of 64 (KL 0.147 at position 8; here 0.086 to 0.323 in the three runs that miss).  iq3-prime-add: position 40, 0.152 on the 4090,
+  0.416 / 0.467 on this card's GPU path, under 0.05 with CPU misses at `auto`; the median KL of those runs is 3e-5;
+- this card against the 4090's all-resident dumps (`eng/*.f32`): mean KL 5.2e-3 to 1.2e-2 on these two fixtures, 5e-4
+  to 2.7e-3 on the other four, the size of either engine's distance from llama.cpp;
+- the four DMA runs repeated: byte-identical dumps.
+
+Open in the ticket: on the 4090 the resident and DMA dumps were the same bytes; here `auto` DMA and `2000` DMA differ
+from each other although the GPU computes every miss (the adaptive tier was on: 139 to 384 experts swapped in during the 64
+tokens), and no all-resident run fits this card at fp16 to compare against.
+
+**The checks.**  `a5.py` of the 4090 section unchanged, the measured ladder's launch (`--mtp qwen36-mtp-draft-full
+--ctx 262144 --threads 8 ... -- --kv q4_0`; the 4090 table used the subset head), greedy, client and server on the VM.
+All nine checks pass in all three configurations.
+
+| check | Q4_K_XL, no cap (3,141 slots) | Q4_K_XL, `--vram-cap 6144` (397 slots) | IQ3_XXS, `--vram-cap 6144` (1,258 slots) |
+| --- | --- | --- | --- |
+| (a) chat, not streamed, thinking off: "capital of France" | pass, 0.61 s | pass, 0.74 s | pass, 0.77 s |
+| (a) chat, not streamed, thinking on: 17 x 23 = 391 | pass, 314 tokens at 63 tok/s | pass, 321 at 43 | pass, 412 at 53 |
+| (b) stream, thinking on: reasoning deltas, first, largest gap | 520, 0.345 s, 108.6 ms | 466, 0.528 s, 131.9 ms | 420, 0.491 s, 105.1 ms |
+| (b) the same request: content deltas, first, largest gap | 89, 8.328 s, 82.6 ms | 89, 11.604 s, 142.8 ms | 55, 8.323 s, 108.1 ms |
+| (b) the same request: tokens, decode, largest gap between any two deltas | 612 at 63 tok/s, 108.6 ms | 558 at 41, 142.8 ms | 478 at 54, 108.1 ms |
+| (b) stream, thinking off (the ticket's request): content deltas, first, largest gap | 207 of 208 tokens, 0.364 s, 73.0 ms | 213 of 214, 0.515 s, 83.2 ms | 204 of 205, 0.471 s, 84.1 ms |
+| (c) tool round trip, not streamed: call, result, answer | pass: `get_weather {"city":"Paris"}`, `tool_calls`, then "17°C with light rain", `stop` | pass | pass |
+| (c) tool round trip, streamed | pass: reasoning 585 deltas, the call in 1 delta at 9.28 s; the answer in 14 content deltas | pass: 546 reasoning deltas, call in 1 at 13.72 s; 14 content deltas | pass: 169, call in 1 at 3.73 s; 18 content deltas |
+| (c) tools declared, not called, streamed, thinking on: content deltas, first, largest gap | 73, 11.704 s, 101.4 ms | 83, 23.747 s, 135.1 ms | 80, 14.626 s, 71.4 ms |
+| (c) the same, thinking off | 71, 0.102 s, 68.4 ms | 76, 0.164 s, 85.5 ms | 69, 0.140 s, 79.2 ms |
+| (d) three-turn chat, tokens reused of the prompt per turn | 0 / 23, 18 / 111, 106 / 154 | 0 / 23, 18 / 143, 138 / 184 | 0 / 23, 18 / 165, 160 / 221 |
+
+The largest gap between any two deltas in any stream is 142.8 ms, a hundredth of the 15 s keepalive; no keepalive
+comment was sent in any run.  The longest silence a client sees is the wait for the first content delta with thinking
+on, during which reasoning deltas arrive: 23.7 s at Q4 `--vram-cap 6144` (974 tokens at 43 tok/s).  A streamed tool
+call still arrives whole, 9.3 to 13.7 s after the request for Q4, with reasoning deltas before it.  `/health` after
+each run: `ram_reads` and `file_reads` 0 (the arena is pinned), VRAM hits per lookup 78% / 29% / 51%.  VRAM after
+load 10,615 / 10,617 / 10,603 MiB (the cap holds the rest of the card back itself), 10,747 / 10,749 / 10,735 at the end.
+
+(d) as on the 4090: the previous prompt less its 5-token header.  `reuse.py` on Q4 no cap: with
+`preserve_thinking` and `reasoning_content` sent back, 942 of 961 and 1,267 of 1,285; without it 18 of 127 and 122 of
+170; thinking off 18 of 236 and 229 of 294.
+
+**Decode speed with this binary** (`sweep_engine_ladder.py --host vm211 --threads 8 --no-depth --no-stability`, the
+ladder's method: cache dropped, fresh launch, regina twice and the short request; `speed/`):
+
+| | regina rep 0 / rep 1, decode tok/s | short, decode tok/s | prefill 3.1K / 203 tokens, tok/s | drafts accepted (regina rep 1) | the ladder with 7ebc9e5: regina rep 1 / short |
+| --- | --- | --- | --- | --- | --- |
+| Q4_K_XL, full card | 66.2 / **66.4** | 66.3 | 942 / 132 | 802 / 967 | 66.3 / 65.3 |
+| IQ3_XXS, full card | 83.3 / **81.2** | 77.8 | 911 / 193 | 792 / 958 | 81.0 / 77.4 |
+
+No regression.
+
+**Not checked.**  pi against this card (check e); images; `--vram-cap 8192`; IQ3 at the full card through `a5.py`
+(its decode is in the speed row); the nondeterminism section's ten-request repeats on this card.
