@@ -229,7 +229,8 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   For Qwen3.6-35B-A3B the cause is traced: an expert the card does not hold is computed by a different
   kernel on the CPU, and the cache keeps changing which experts those are for the first few requests; replies
   diverge only where two tokens are within about 0.3 logits, and every state holds to llama.cpp's logits.
-  `--pcie-frac 1.0`, or `--adapt-every 0 --suffix-draft 0`, makes a request repeat token for token.
+  `--adapt-every 0 --suffix-draft 0` makes a request repeat token for token. `--pcie-frac 1.0` does too
+  only while a layer misses fewer than 16 experts per window; past that the rest are computed on the CPU.
 - Qwen3.6-35B-A3B: between user turns the prompt cache reuses the previous prompt but not the previous reply,
   because the model's template re-renders an earlier reply without its reasoning. Tool loops reuse nearly
   everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
