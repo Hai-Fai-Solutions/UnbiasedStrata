@@ -615,8 +615,9 @@ int main(int argc, char** argv) {
     if (at != std::string::npos) shard2.replace(at, 15, "-00002-of-00002");
     else shard2.clear();
     const std::string profile = o.pack + "/expert-profile.bin";
-    for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
-                                 o.mtp + "/draft_vocab.bin"})
+    // draft_vocab.bin is the draft head's vocabulary subset; a Qwen3.6 draft pack built with the full head
+    // (tools/mtp_qwen36_pack.py --full-head) has none and the engine then drafts over the whole vocabulary
+    for (const std::string& f : {o.model, shard2, o.pack + "/index.txt", profile, o.mtp + "/experts.bin"})
         if (!f.empty() && !file_exists(f)) { std::fprintf(stderr, "unbiased-strata: missing file: %s\n", f.c_str()); return 2; }
     if (o.ctx < 1024) { std::fprintf(stderr, "unbiased-strata: --ctx must be at least 1024\n"); return 2; }
 

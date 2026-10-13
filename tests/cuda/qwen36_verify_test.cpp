@@ -478,8 +478,32 @@ int main(int argc, char** argv) {
         const int eq = argmax_equal(lg40, roq, 0, (size_t) V, miss);
         std::string m32;
         const int eq32 = argmax_equal(lg40, ro, 0, (size_t) V, m32);
-        check(eq == 40, "argmax per position equals the Q8 oracle's: " + std::to_string(eq) + " of 40" + (miss.empty() ? "" : " (differs at " + miss + ")") +
-                        "; the F32 oracle's: " + std::to_string(eq32) + " of 40" + (m32.empty() ? "" : " (differs at " + m32 + ")"));
+        // A near tie cannot discriminate the engine: a position where the two references disagree with each other
+        // (the runner check, qwen36_runner_check.py, excludes the same positions), or where the Q8 oracle's top-two
+        // margin, (top1 - top2) / |top1|, is below the engine row's own rel L2 error against that oracle (a flip
+        // inside the measured error; on the 4090 position 4 of this fixture flips between runs with a 0.4% margin
+        // under a 1.4% row error).  The gate runs over the other positions and reports the ties with their margins.
+        std::string ties;
+        int unambiguous = 0, eq_un = 0;
+        for (int t = 0; t < 40; ++t) {
+            const float* rq = roq.data() + (size_t) t * V;
+            const size_t a32 = argmax(ro.data() + (size_t) t * V, (size_t) V), aq8 = argmax(rq, (size_t) V);
+            float top1 = rq[aq8], top2 = -INFINITY;
+            for (size_t i = 0; i < (size_t) V; ++i) if (i != aq8 && rq[i] > top2) top2 = rq[i];
+            const double margin = (top1 - top2) / std::max(1e-30, (double) std::fabs(top1));
+            const double row_err = rel_l2(lg40[(size_t) t].data(), rq, (size_t) V);
+            if (a32 != aq8 || margin < row_err) {
+                ties += (ties.empty() ? "" : ", ") + std::to_string(t) + (a32 != aq8 ? " (oracles disagree" : " (margin ") +
+                        (a32 != aq8 ? std::string() : fmt(margin) + " < row error " + fmt(row_err)) + ")";
+                continue;
+            }
+            ++unambiguous;
+            eq_un += argmax(lg40[(size_t) t].data(), (size_t) V) == aq8;
+        }
+        check(eq_un == unambiguous, "argmax per position equals the Q8 oracle's at " + std::to_string(eq_un) + " of " + std::to_string(unambiguous) +
+                                    " unambiguous positions (all 40: Q8 " + std::to_string(eq) + (miss.empty() ? "" : ", differs at " + miss) +
+                                    "; F32 " + std::to_string(eq32) + (m32.empty() ? "" : ", differs at " + m32) + ")" +
+                                    (ties.empty() ? "" : "; near ties, not gated: [" + ties + "]"));
     }
 
     std::printf("%s: %d failure(s)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
