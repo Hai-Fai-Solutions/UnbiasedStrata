@@ -298,13 +298,17 @@ struct Server {
         p.parser.parse_tool_calls = true;
         if (!cp.parser.empty()) p.parser.parser.load(cp.parser);
 
+        // The engine refuses a request unless prompt + max_new + 8 <= context (generate.cpp, the GEN handler), so
+        // the slots it keeps back are not ours to promise.  Without this a client that asks for "as much as fits"
+        // (pi sends max_tokens 32768 on a 64K card) was refused on every prompt longer than ctx - max_tokens.
+        constexpr long long kEngineReserve = 8;
         const long long n = (long long) p.ids.size();
-        if (n + 1 > opt.ctx) {
+        if (n + 1 + kEngineReserve > opt.ctx) {
             err = "the prompt is " + std::to_string(n) + " tokens, which does not fit the context of " +
                   std::to_string(opt.ctx);
             return false;
         }
-        long long max_new = opt.ctx - n;
+        long long max_new = opt.ctx - n - kEngineReserve;
         for (const char* key : {"max_completion_tokens", "max_tokens"})
             if (body.contains(key) && body.at(key).is_number()) {
                 const long long want = body.at(key).get<long long>();

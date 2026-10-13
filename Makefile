@@ -60,3 +60,9 @@ test-chat-parser:
 	  $(BUILD_DIR)/ggml/src/libggml.a $(BUILD_DIR)/ggml/src/libggml-cpu.a $(BUILD_DIR)/ggml/src/libggml-base.a \
 	  $(BUILD_DIR)/llama.cpp/common/libllama-common-base.a -lpthread -ldl -lm
 	$(BUILD_DIR)/frontend-tests/chat-parser-test "$(MODEL)"
+
+# Against a running server: a request may ask for more tokens than the context has left (REGINA-112).
+.PHONY: test-serve
+test-serve:
+	@test -n "$(PORT)" || { echo 'set PORT to a running server ([HOST:]PORT)'; exit 2; }
+	python3 tests/python/serve_max_tokens_check.py $(PORT)
