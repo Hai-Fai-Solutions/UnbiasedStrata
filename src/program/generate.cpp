@@ -1912,6 +1912,12 @@ int main(int argc, char** argv) {
                              "engine to) and is not a --serve mode\n");
         return 2;
     }
+    if (o.teacher_force && !o.mtp.empty()) {
+        // the window's rows after the first would be the drafter's guesses, and teacher forcing commits every row:
+        // the state then holds tokens the oracle never had (seen as 70 of 400 top-1 on a run that is 394 without)
+        std::fprintf(stderr, "strata generate: --teacher-force takes its window rows from --spec-oracle; drop --mtp\n");
+        return 2;
+    }
     if (o.no_ple && !o.ple_gguf.empty()) {
         std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
         return 2;
@@ -7509,6 +7515,52 @@ int main(int argc, char** argv) {
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                // Diagnostics, STRATA_SERVE_LOGIT_TRACE=FILE: one line per emitted token with the head's five
+                // largest logits, the window's shape and the experts it missed, so two runs of one request can
+                // be compared where they part (docs/qwen36-port/step5-serve.md, "The same greedy request").
+                // With STRATA_SERVE_LOGIT_DUMP=PREFIX too, every emitted token's whole row goes to
+                // PREFIX.<request>.f32 (raw F32, tools/qwen36_compare_logits.py --no-engine-header): 1 MB a token.
+                // The window's result is not touched.
+                static FILE* const logit_trace = [] {
+                    const char* f = std::getenv("STRATA_SERVE_LOGIT_TRACE");
+                    return f != nullptr && *f != '\0' ? std::fopen(f, "a") : nullptr;
+                }();
+                if (logit_trace != nullptr) {
+                    static std::vector<float> row;
+                    static int64_t tr_miss = 0, tr_pcie = 0, tr_hits = 0, tr_req = -1;
+                    if (first_window) ++tr_req;
+                    static FILE* dumpf = nullptr;
+                    row.resize((size_t) ver.vocab());
+                    if (first_window) {
+                        if (dumpf != nullptr) std::fclose(dumpf);
+                        const char* pre = std::getenv("STRATA_SERVE_LOGIT_DUMP");
+                        dumpf = pre != nullptr && *pre != '\0'
+                                    ? std::fopen((std::string(pre) + "." + std::to_string(tr_req) + ".f32").c_str(), "wb") : nullptr;
+                    }
+                    for (int i = 0; i <= a && produced_n + i < max_new; ++i) {
+                        if (!ver.copy_logits(i, row.data())) break;
+                        if (dumpf != nullptr) std::fwrite(row.data(), sizeof(float), row.size(), dumpf);
+                        int top[5];
+                        for (int k = 0; k < 5; ++k) {
+                            int best = -1;
+                            for (int v = 0; v < (int) row.size(); ++v) {
+                                bool taken = false;
+                                for (int q = 0; q < k; ++q) taken = taken || top[q] == v;
+                                if (!taken && (best < 0 || row[(size_t) v] > row[(size_t) best])) best = v;
+                            }
+                            top[k] = best;
+                        }
+                        std::fprintf(logit_trace, "L %lld %lld %d row %d of T %d%s miss %lld pcie %lld hits %lld top",
+                                     (long long) tr_req, (long long) (produced_n + i), (int) outv[(size_t) i], i, T,
+                                     from_sfx ? " sfx" : "", (long long) (drive.d.multi_misses - tr_miss),
+                                     (long long) (drive.d.pcie_experts - tr_pcie), (long long) (drive.d.cache_hits - tr_hits));
+                        for (int k = 0; k < 5; ++k) std::fprintf(logit_trace, " %d:%.6f", top[k], (double) row[(size_t) top[k]]);
+                        std::fputc('\n', logit_trace);
+                    }
+                    tr_miss = drive.d.multi_misses; tr_pcie = drive.d.pcie_experts; tr_hits = drive.d.cache_hits;
+                    std::fflush(logit_trace);
+                    if (dumpf != nullptr) std::fflush(dumpf);
+                }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;

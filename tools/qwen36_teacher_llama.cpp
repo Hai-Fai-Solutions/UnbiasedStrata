@@ -9,6 +9,9 @@
 //
 //   qwen36-teacher MODEL.gguf OUTDIR --prompt-file FILE [--n-gen 64] [--ngl 99] [--ctx 8192] [--probe 0,3,20,39]
 //   qwen36-teacher MODEL.gguf --detok FILE        the ids in FILE (commas or whitespace) as text, to stdout
+//   --prompt-ids FILE   the prompt as token ids (commas or whitespace) instead of --prompt-file's text
+//   --force-ids FILE    teacher forcing: row j's logits are written, then FILE's j-th token is decoded instead of the
+//                       argmax (continuation.txt still holds the argmax per row); --n-gen is capped at FILE's length
 //
 // Writes OUTDIR/prompt_ids.txt (the prompt's token ids, parse_special on: the ChatML tags of the regina prompts are
 // tokens), OUTDIR/continuation.txt (the N greedy tokens), OUTDIR/logits.f32 (N rows of n_vocab F32: row j is the
@@ -76,13 +79,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string model_path = argv[1];
-    std::string outdir, prompt_file, detok;
+    std::string outdir, prompt_file, prompt_ids, force_ids, detok;
     int n_gen = 64, ngl = 99, n_ctx = 8192;
     std::set<int> probe = {0, 3, 20, 39};
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(1); } return argv[++i]; };
         if (a == "--prompt-file") prompt_file = next();
+        else if (a == "--prompt-ids") prompt_ids = next();
+        else if (a == "--force-ids") force_ids = next();
         else if (a == "--n-gen") n_gen = std::atoi(next());
         else if (a == "--ngl") ngl = std::atoi(next());
         else if (a == "--ctx") n_ctx = std::atoi(next());
@@ -109,16 +114,31 @@ int main(int argc, char** argv) {
         llama_backend_free();
         return 0;
     }
-    if (outdir.empty() || prompt_file.empty()) { std::fprintf(stderr, "OUTDIR and --prompt-file are required\n"); return 1; }
+    if (outdir.empty() || (prompt_file.empty() && prompt_ids.empty())) { std::fprintf(stderr, "OUTDIR and --prompt-file or --prompt-ids are required\n"); return 1; }
     mkdir(outdir.c_str(), 0755);
-    std::ifstream pf(prompt_file);
-    std::string prompt((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
-    while (!prompt.empty() && prompt.back() == '\n') prompt.pop_back();   // the files end in one newline the prompt does not
-    std::vector<llama_token> toks(prompt.size() + 16);
-    int n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(), false, true);
-    if (n < 0) { toks.resize((size_t) -n); n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(), false, true); }
-    if (n <= 0) { std::fprintf(stderr, "tokenize failed\n"); return 1; }
-    toks.resize((size_t) n);
+    std::vector<llama_token> toks;
+    int n = 0;
+    if (!prompt_ids.empty()) {
+        toks = read_ids(prompt_ids);
+        n = (int) toks.size();
+        if (n <= 0) { std::fprintf(stderr, "no ids in %s\n", prompt_ids.c_str()); return 1; }
+        prompt_file = prompt_ids;
+    } else {
+        std::ifstream pf(prompt_file);
+        std::string prompt((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+        while (!prompt.empty() && prompt.back() == '\n') prompt.pop_back();   // the files end in one newline the prompt does not
+        toks.resize(prompt.size() + 16);
+        n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(), false, true);
+        if (n < 0) { toks.resize((size_t) -n); n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), toks.data(), (int32_t) toks.size(), false, true); }
+        if (n <= 0) { std::fprintf(stderr, "tokenize failed\n"); return 1; }
+        toks.resize((size_t) n);
+    }
+    std::vector<llama_token> forced;
+    if (!force_ids.empty()) {
+        forced = read_ids(force_ids);
+        if (forced.empty()) { std::fprintf(stderr, "no ids in %s\n", force_ids.c_str()); return 1; }
+        n_gen = std::min(n_gen, (int) forced.size());
+    }
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     Routes routes;
@@ -152,7 +172,7 @@ int main(int argc, char** argv) {
         text += piece(vocab, t);
         if (j + 1 == n_gen) break;
         routes.row = j + 1;   // the next decode's logits are row j + 1
-        llama_token one = t;
+        llama_token one = forced.empty() ? t : forced[(size_t) j];
         if (llama_decode(ctx, llama_batch_get_one(&one, 1))) { std::fprintf(stderr, "decode failed at row %d\n", j + 1); return 1; }
     }
     std::fclose(lf);
