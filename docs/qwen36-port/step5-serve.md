@@ -439,3 +439,52 @@ BF16 GEMM through fp32 and no tensor-core MoE on sm_61), so they are not expecte
 with the F32 oracle to 4e-3; the other four fixtures against the oracle or a second llama.cpp run; llama.cpp fully
 offloaded on a second card (neither file fits the 1080 Ti); whether the overflow makes a served request differ between
 passes (inferred from the CPU rows above, not run); the 262,144 q4_0 configuration.
+
+## Flash-Next regression check
+
+2026-10-13, VM 221 (RTX 4090, 62 GB RAM), card otherwise idle.  Does the branch still serve Qwen3.8-Flash-Next as the
+production binary does?  Production: `/tank/nvme/strata/unbiased-strata`, sha256 `abbe990f4e3c658e` (main's lineage
+with 121d23a).  Branch: `/models/work/qwen36-step4/build/unbiased-strata`, `11da5388afdfabcb` at d00d383 and
+`5428c8d791f7a697` at 0513d5b.  Both started by hand with the command line of `unbiased-strata.service` on
+127.0.0.1:18091 (`--ctx 196608 --mmproj ... --threads 8 -- --kv-resident 32768 --ple-io mmap --kv int8`,
+`CUDA_MODULE_LOADING=EAGER`, memlock unlimited; the unit's first-prompt capture variable left out so the captured file
+was not overwritten).  Scripts and logs: `/models/work/flashcheck/`.
+
+**One fault, fixed (REGINA-112).**  The branch took f07b81e from main but not 121d23a, so its front end sized
+`max_new` as context - prompt and the engine (prompt + max_new + 8 <= context) refused every request that sent no
+`max_tokens`, and any with `max_tokens` at or above context - prompt - 7, with a 500.  The serving checks below did
+not see it because each sets `max_tokens`.  0513d5b carries main's hunk and `tests/python/serve_max_tokens_check.py`
+(`make test-serve PORT=...`): 0 of 5 on `11da5388`, 5 of 5 on production and on `5428c8d7`, the latter on Flash-Next
+at 196,608 and on Qwen3.6 Q4_K_XL at 262,144.
+
+**Serving**, `a5.py` of the A5 section and one image request, on both branch binaries:
+
+| check | d00d383 | 0513d5b |
+| --- | --- | --- |
+| start, plan | 10,368 expert slots (production 10,373), 430 MiB free, KV 32,768 of 196,608 cells resident | the same |
+| `/health`, `/v1/models` | ok, tiers; `input_modalities` text, image | ok |
+| chat, not streamed, thinking off / on | pass / pass (391) | pass / pass |
+| stream, thinking on: reasoning deltas, content deltas | 84, 41 of 128 tokens, largest gap 77 ms | 90, 50 of 143 |
+| stream, thinking off: content deltas | 193 of 194 tokens | 200 of 201 |
+| tool round trip, not streamed / streamed | pass / pass (the call in 1 delta, the answer in 14) | pass / pass (16) |
+| tools declared, not called, streamed, thinking on / off | 79 / 90 content deltas | pass / pass |
+| three turns, tokens reused of the prompt | 0 / 65, 60 / 138, 133 / 169 | 0 / 65, 60 / 145, 140 / 176 |
+| image (96 x 96 PNG, red left, blue right) | pass, 1.0 s, 41 prompt tokens | pass |
+
+**Speed**, greedy, reasoning off: 4 prompts of 400 tokens and 2 prompts of 19,593 and 20,820 tokens, five passes per
+start, production, branch (d00d383), production, branch.  The host holds 62 GB against 76 GB of model files, so
+14,208 of the 24,576 experts and the n-gram table are read through the file cache and the first two passes of a start
+measure the cache (60 tokens/s and 700 prompt tokens/s on both binaries on the first pass).  The table is passes 3 to
+5, tokens over time, per start:
+
+| | Generation, tokens/s | Prompt, tokens/s |
+| --- | --- | --- |
+| Production | 89.5, 92.1 (74 to 109 per prompt) | 2,093, 2,098 |
+| Branch | 89.0, 89.2 (74 to 107) | 2,092, 2,094 |
+| Branch / production | 0.98 | 1.00 |
+
+Drafts accepted 0.61 to 0.62 of those offered on both.  The 2% in generation is inside the spread between the two
+production starts.
+
+**ctest**, the branch build at d00d383 on the free card: 94 of 98 pass, `pack_load_check` skipped, and the three
+host failures (`ple_parity`, `platform_memory_test`, `expert_multi_test`).
