@@ -114,7 +114,9 @@ quantizations, with the pack and draft pack made by this repository's own tools 
 | Draft pack `qwen36-mtp-draft/` (`experts.bin`, `dense.bin`, `dense.txt`, `native_experts.txt`, `mtp.json`, `draft_vocab.bin`), cut from the -MTP file's draft block; serves both quantizations | 0.5 GB | per file in UPSTREAM.md |
 
 No other Qwen3.6 file is accepted: the IQ4_XS-MTP file's draft block (Q3_K experts) and the 27B dense model
-are refused by name. The vision encoder (`mmproj`) is not wired for this model yet.
+are refused by name. Images work with `--mmproj` and the model's own encoder (`mmproj-F16.gguf` from the -MTP repository,
+899 MB); the encoder runs on the CPU, so the first use of a full-screen image costs 24 s on an i9-9900K and
+about 70 s on a Ryzen 7 1700, and repeats are served from a cache.
 
 #### Sizing
 
@@ -235,7 +237,8 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   because the model's template re-renders an earlier reply without its reasoning. Tool loops reuse nearly
   everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
   `reasoning_content` sent back reuses the reply too, at the cost of keeping old reasoning in context.
-  A tool call arrives as one delta, not streamed. Images are not wired; the RTX 50 and Volta builds have not
+  A tool call arrives as one delta, not streamed. Images are checked on one screenshot only, and not
+  against llama.cpp; the RTX 50 and Volta builds have not
   run on a card. Prompt processing is slower than llama.cpp with every expert on the card, at 6 GB, and for long
   prompts on a GTX 1080 Ti.
 
