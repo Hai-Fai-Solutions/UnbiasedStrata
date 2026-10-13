@@ -192,21 +192,20 @@ Prompt processing is the weak side: with every expert resident llama.cpp is twic
 spends the prompt copying experts to the card. Full tables, profiler windows and plots are in the regina
 repository's `analysis/qwen36-35b-single-gpu-ladder/engine-4090/`.
 
-On the GTX 1080 Ti (VM, 14 vCPU of a Ryzen 7 1700, 52 GB RAM), 262,144 context at every budget, decode tokens/s
-for the same 1,200-token answer:
+On the GTX 1080 Ti (VM, 14 vCPU of a Ryzen 7 1700, 52 GB RAM), against llama.cpp on the same card and host
+(`--n-cpu-moe N` at the lowest N that fits each budget, 8 threads, no speculation, the model file in RAM).
+262,144 context on both sides. Tokens/s, engine / llama.cpp:
 
-| Budget | Q4_K_XL | IQ3_XXS |
-| --- | --- | --- |
-| 11 GB (the card) | 66 | 81 |
-| 8 GB (`--vram-cap 8192`) | 54 | 69 |
-| 6 GB (`--vram-cap 6144`) | 42 | 55 |
+| Budget | Q4_K_XL decode | Q4_K_XL prefill 3.1K | Q4_K_XL prefill 32K | IQ3_XXS decode | IQ3_XXS prefill 3.1K | IQ3_XXS prefill 32K |
+| --- | --- | --- | --- | --- | --- | --- |
+| 11 GB (the card) | 66 / 28 (2.4x) | 941 / 570 (1.7x) | 462 / 545 (0.85x) | 81 / 33 (2.5x) | 910 / 904 (1.0x) | 453 / 714 (0.63x) |
+| 8 GB (`--vram-cap 8192`) | 54 / 25 (2.1x) | 911 / 488 (1.9x) | 442 / 487 (0.91x) | 69 / 28 (2.5x) | 900 / 747 (1.2x) | 453 / 637 (0.71x) |
+| 6 GB (`--vram-cap 6144`) | 42 / 24 (1.8x) | 361 / 452 (0.80x) | 265 / 460 (0.58x) | 55 / 24 (2.3x) | 748 / 614 (1.2x) | 437 / 562 (0.78x) |
 
-llama.cpp on this card was measured earlier in a 12 GiB VM: 32.5, 28.2 and 20.6 at IQ3_XXS for the three budgets
-(2.5x to 2.7x), and 13.4, 9.4 and 6.8 at Q4_K_XL, where it was reading experts from the NVMe. The Q4_K_XL comparison
-with both engines in RAM is not measured yet. The engine under the same 12 GiB bound decodes Q4_K_XL at 18.8.
-The draft head is worth a third: 49 tokens/s without drafts at Q4_K_XL on the full card. Prompt speed on this card
-is 900 to 940 tokens/s on a 3.1K prompt and 440 to 460 on a 32K prompt (361 and 265 for Q4_K_XL at 6 GB). Tables and
-plots: regina `analysis/qwen36-35b-single-gpu-ladder/engine-1080ti/`.
+Decode is 1.8 to 2.5 times llama.cpp; the GPU computes 85% of the decode window against llama.cpp's 39 to 45%.
+A long prompt is slower than llama.cpp at every budget on this card. The draft head is worth a third of the decode
+speed (49 tokens/s without drafts at Q4_K_XL on the full card). Tables and plots: regina
+`analysis/qwen36-35b-single-gpu-ladder/engine-1080ti/` and `llama-1080ti-52g/`.
 
 Speed, one run of each, same machine and model files, greedy sampling, reasoning off. Generation is the mean
 of 8 different prompts of 400 tokens; prompt speed is the mean of 2 different prompts of about 20,000 tokens.
@@ -236,7 +235,8 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
   `reasoning_content` sent back reuses the reply too, at the cost of keeping old reasoning in context.
   A tool call arrives as one delta, not streamed. Images are not wired; the RTX 50 and Volta builds have not
-  run on a card. Prompt processing is slower than llama.cpp with every expert on the card and at 6 GB.
+  run on a card. Prompt processing is slower than llama.cpp with every expert on the card, at 6 GB, and for long
+  prompts on a GTX 1080 Ti.
 
 ## Compared with upstream Strata (6f32ec0)
 
