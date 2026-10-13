@@ -475,6 +475,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_layout_test PRIVATE strata_engine)
     add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
     set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
+    # the pool's native-pack rows at the layer's widths (Qwen3.6's 2048 x 512), not the canonical FF / H
+    add_executable(pool_native_widths_test tests/core/pool_native_widths_test.cpp)
+    target_link_libraries(pool_native_widths_test PRIVATE strata_engine)
+    add_test(NAME pool_native_widths_test COMMAND pool_native_widths_test)
+    set_tests_properties(pool_native_widths_test PROPERTIES TIMEOUT 120)
     # #326: a native pack's BF16 (--compat-bf16) PLE key stays in the arena; a quantized key row loads as before
     add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
     target_link_libraries(native_dense_ple_key_test PRIVATE strata_engine)

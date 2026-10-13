@@ -39,7 +39,16 @@ int strata_engine_main(int argc, char** argv);
 
 namespace {
 
-const char* const kModelName = "qwen3.8-flash-next-iq3_xxs";
+// the model id reported on /v1/models and in every completion: the GGUF's base name (`Qwen3.6-35B-A3B-UD-IQ3_XXS`,
+// `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` for shard 1 without its `-00001-of-00002`), set once the options are parsed
+std::string g_model_name = "unbiased-strata";
+std::string model_name_of(const std::string& path) {
+    std::string b = path.substr(path.find_last_of('/') == std::string::npos ? 0 : path.find_last_of('/') + 1);
+    if (b.size() > 5 && b.compare(b.size() - 5, 5, ".gguf") == 0) b.resize(b.size() - 5);
+    const size_t at = b.rfind("-00001-of-");
+    if (at != std::string::npos) b.resize(at);
+    return b.empty() ? std::string("unbiased-strata") : b;
+}
 
 struct Options {
     std::string model;                  // shard 1 of the GGUF
@@ -443,7 +452,7 @@ struct Server {
             out["id"] = id;
             out["object"] = "chat.completion";
             out["created"] = created;
-            out["model"] = kModelName;
+            out["model"] = g_model_name;
             out["choices"] = common_json::array();
             out["choices"].push_back(choice);
             out["usage"] = usage_json(r);
@@ -464,7 +473,7 @@ struct Server {
                 out["id"] = id;
                 out["object"] = "chat.completion.chunk";
                 out["created"] = created;
-                out["model"] = kModelName;
+                out["model"] = g_model_name;
                 out["choices"] = common_json::array();
                 out["choices"].push_back(choice);
                 if (done) { out["usage"] = usage_json(*done); out["timings"] = timings_json(*done); }
@@ -606,6 +615,7 @@ int main(int argc, char** argv) {
     Server srv;
     Options& o = srv.opt;
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
+    g_model_name = model_name_of(o.model);
 
     // every file the engine needs must already be here: nothing is fetched
     // Flash-Next ships as two shards and the second holds the PLE table, so it is the engine's --ple-gguf; a one-file
@@ -716,7 +726,7 @@ int main(int argc, char** argv) {
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         if (!srv.engine.alive()) return json_error(res, 503, "the engine is not running", "server_error");
         common_json m = common_json::object();
-        m["id"] = kModelName;
+        m["id"] = g_model_name;
         m["object"] = "model";
         m["owned_by"] = "local";
         m["context_length"] = srv.opt.ctx;
