@@ -2216,8 +2216,11 @@ int main(int argc, char** argv) {
                 const int64_t n_vocab_file = n_dvocab;
                 std::error_code ec;
                 const auto dv = std::filesystem::file_size(o.mtp + "/draft_vocab.bin", ec);
-                if (!ec && dv >= 4) n_dvocab = (int64_t) (dv / 4);
-                in.drafter_head_bytes = (uint64_t) n_dvocab * head_row + (uint64_t) 8 * (uint64_t) n_vocab_file * 4;
+                // With a vocabulary subset the drafter gathers its own head (n_dvocab rows); without one it scores
+                // with the target's head and allocates no copy (mtp.cpp: dhead_ stays null), so only the logits count
+                const bool subset = !ec && dv >= 4;
+                if (subset) n_dvocab = (int64_t) (dv / 4);
+                in.drafter_head_bytes = (subset ? (uint64_t) n_dvocab * head_row : 0) + (uint64_t) 8 * (uint64_t) n_vocab_file * 4;
                 in.drafter_ids_bytes_per_token = (uint64_t) std::max(o.spec, 1) * 4;
             }
             in.n_experts = g.n_layers * g.n_expert;
@@ -2232,7 +2235,9 @@ int main(int argc, char** argv) {
         const double kv_elem = o.kv == "q4_0" ? 18.0 / 32.0 : o.kv == "int8" ? 1.0 + 2.0 / 64.0 : o.kv == "k8v4" ? 816.0 / 1024.0 : 2.0;
         in.kv_bytes_per_token = (uint64_t) (g.n_qsa_layers() * 2 * g.n_head_kv * g.head_dim * kv_elem);
         // the drafter's one attention layer, the same format, the whole context (no ring without --kv-resident)
-        if (!o.mtp.empty()) in.drafter_kv_bytes_per_token = (uint64_t) (2 * g.n_head_kv * g.head_dim * kv_elem);
+        // (under --kv k8v4 the drafter keeps plain INT8 K/V, mtp.cpp: charged as such, not as the hybrid's bytes)
+        const double drafter_kv_elem = o.kv == "k8v4" ? 1.0 + 2.0 / 64.0 : kv_elem;
+        if (!o.mtp.empty()) in.drafter_kv_bytes_per_token = (uint64_t) (2 * g.n_head_kv * g.head_dim * drafter_kv_elem);
         // the session: one RoPE table (max_cells x n_rot/2 x 2 floats), the GDN state, ~36 MiB of scratch
         in.session_bytes = (uint64_t) o.max_context * (uint64_t) g.n_rot * 4 +
                            (uint64_t) g.n_gdn_layers() * ((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
@@ -2265,6 +2270,42 @@ int main(int argc, char** argv) {
                      strata::plan::vram_plan_text(in, plan, "  ").c_str());
         if (!plan.fits) {
             std::fprintf(stderr, "strata generate: %s\n", plan.refusal.c_str());
+            return 2;
+        }
+        if (plan.lowered) {   // the plan's context is the one everything below allocates for, not the request's
+            std::fprintf(stderr, "strata generate: the context is lowered from %lld to %lld tokens by the VRAM plan above\n",
+                         (long long) o.max_context, (long long) plan.context);
+            o.max_context = plan.context;
+        }
+        // The RAM tier.  The resident arena pins every expert in RAM; when the host cannot hold that (the plan's
+        // 12 GiB rung: --ram-cap, a cgroup limit, or simply less RAM than the file), the experts stay mapped from the
+        // file and the hottest ones by profile rank are copied into RAM (the --resident-experts mode), which is what
+        // the plan's "expert copies in RAM" line already assumed.  Chosen here, before anything keys on the mode;
+        // an explicit --mmap-experts / --resident-experts is left alone.
+        if (!o.mmap_experts) {
+            const auto& lay2 = strata::kernels::cpu::expert_layout();
+            strata::core::detail::HostMemory hm;
+            if (lay2.native && lay2.total > 0 && strata::core::detail::host_available_memory(hm)) {
+                const uint64_t need = lay2.total + (uint64_t) lay2.max_blob;
+                if (hm.cgroup_limit < need || hm.available < need) {
+                    const double gib = 1073741824.0;
+                    std::fprintf(stderr, "strata generate: RAM tier: the resident expert arena needs %.2f GiB but the host "
+                                         "allows %.2f GiB (%s): the experts stay mapped from the file and the hottest are copied "
+                                         "into RAM by profile rank (as --resident-experts)\n",
+                                 (double) need / gib, (double) std::min(hm.cgroup_limit, hm.available) / gib,
+                                 hm.cgroup_limit < need ? "the memory limit" : "available RAM");
+                    o.mmap_experts = true;
+                    if (!o.expert_profile.empty()) {
+                        o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
+                        o.resident_headroom = 4ull << 30;
+                    }
+                }
+            }
+        }
+        if ((o.peer_device >= 1 || o.remote_expert_opt) && g.n_embd != (int64_t) strata::kernels::cpu::H) {
+            std::fprintf(stderr, "strata generate: the multi-GPU expert helpers (--peer-device, --remote-expert-opt) are "
+                                 "compiled for the canonical %d-wide expert and are not available for this model (n_embd %lld)\n",
+                         (int) strata::kernels::cpu::H, (long long) g.n_embd);
             return 2;
         }
         // a native pack decodes in verify windows only (plan v0.3 P6), and this model has no MTP drafter wired yet
