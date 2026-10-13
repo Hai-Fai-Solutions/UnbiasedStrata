@@ -171,7 +171,7 @@ Qwen3.6-35B-A3B, checked on the RTX 4090 (VM, 16 vCPU i9-9900K, 62 GB RAM, CUDA 
 | | |
 | --- | --- |
 | Correctness | the engine's logits held to a numpy reference and to llama.cpp at every position of the real files (greedy top-1 64/64 on three prompts at IQ3_XXS, 61-64/64 at Q4_K_XL, mean KL 1e-3 to 7e-3); the expert-miss path (what every card below 24 GB runs on) held with the same prompts under `--vram-cap` |
-| Serving | chat, streaming, reasoning, tool calls, multi-turn prompt checkpoints at 262,144 context; both quantizations |
+| Serving | chat, streaming of reasoning and answer per token, tool calls streamed and not, multi-turn prompt checkpoints at 262,144 context, at 24 GB, under an 11 GB cap (Q4_K_XL) and a 6 GB cap (IQ3_XXS); a coding agent (pi) wrote and ran a program through it |
 | Pascal | built and unit-tested on a GTX 1080 Ti (sm_61: every kernel parity test, the pack, the drafter, the verify window); the expert-miss path held to llama.cpp's logits there too |
 
 Speed against llama.cpp on the same card (RTX 4090, `--vram-cap` for the smaller budgets, 262,144 context,
@@ -227,10 +227,12 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   token. Upstream's tokenizer keeps it as plain text.
 - Replies are not reproducible token for token between runs or between this fork and upstream, even with
   greedy sampling, so "same output" cannot be checked by comparing text.
-- Qwen3.6-35B-A3B: the multi-turn checkpoint reuses a shorter prefix than the previous turn's length (27 of
-  278 tokens in one two-turn test); images are not wired; the RTX 50 and Volta builds have not run on a
-  card; with `stream` on, the answer's text arrives as one delta after the reasoning (the reasoning streams
-  per token); prompt processing is slower than llama.cpp with every expert on the card and at 6 GB.
+- Qwen3.6-35B-A3B: between user turns the prompt cache reuses the previous prompt but not the previous reply,
+  because the model's template re-renders an earlier reply without its reasoning. Tool loops reuse nearly
+  everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
+  `reasoning_content` sent back reuses the reply too, at the cost of keeping old reasoning in context.
+  A tool call arrives as one delta, not streamed. Images are not wired; the RTX 50 and Volta builds have not
+  run on a card. Prompt processing is slower than llama.cpp with every expert on the card and at 6 GB.
 
 ## Compared with upstream Strata (6f32ec0)
 
