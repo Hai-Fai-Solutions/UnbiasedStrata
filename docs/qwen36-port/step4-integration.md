@@ -44,7 +44,9 @@ The expected `generate.cpp` conflict between the drafter's draft-geometry hunk (
 
 ## Owed to step 5
 
-1. Full ctest of the integrated tree on a card with free VRAM (4090 when its service stops, or RunPod).
+1. ~~Full ctest of the integrated tree on a card with free VRAM.~~  Done 2026-10-13 once the 4090's service was
+   stopped: 95 of 98 at 22d72e6 (the three host-environment failures), including the serve fixes and
+   `pool_native_widths_test` of step5-serve.md.
 2. The 1080 Ti real-file comparison (sync `/models/work/qwen36-step4-teacher` to VM 211) and the Q4 fit at 11 GB.
 3. The ladder: serve and measure on 11 GB, then `--vram-cap` 8 and 6 GB; the three instruments; engine points on
    `ladder-baseline.png`; acceptance A1-A5.
