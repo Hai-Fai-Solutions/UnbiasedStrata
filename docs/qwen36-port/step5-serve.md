@@ -66,9 +66,77 @@ arguments was fault 3).  The response's `model` field is now the GGUF's base nam
   memory (`cudaHostRegister PORTABLE`, 18.3 GiB for Q4), and a miss is served from it by DMA or the CPU; `ram_reads`
   and `file_reads` on `/health` stay 0.  On a 12 GiB host the arena cannot hold the file and the mapped-from-disk
   tier is what the ladder measures (`--ram-cap` emulates it here).
-- Checkpoint reuse: the second turn reused 27 of 278 prompt tokens; the reuse boundary is a measurement for the
-  ladder (a long conversation, the `tokens reused` figure per turn).
+- Checkpoint reuse: the second turn reused 27 of 278 prompt tokens.  Cause and the opt-in that lifts it: the A5
+  section below, check (d).
 - `expert cache ... policy is` prints an empty policy name for native packs (cosmetic).
 - At 262,144 the Q4 fixed set leaves 19.3 GiB for experts; 9,980 slots fit; the planner's "10240 of 10240 (100%)"
   line and the cache's "9980 slots" disagree by the 700 MiB runtime reserve the cache keeps; the plan line should
   say what the cache will actually hold.
+
+## A5 on the 4090: the serving checks, after the streaming fix (REGINA-110)
+
+**The fault.**  With `"stream": true` the answer arrived as one `content` delta before the final chunk; only
+`reasoning_content` streamed.  Not the parser: `run()` in `frontend/main.cpp` cleared the content of every partial
+parse together with its tool calls, a rule that came with 46c46ec so that partial tool-call JSON (closed and
+normalized by the parser on each token) could never change text already sent.  That holds for a call's arguments,
+not for the answer.  c3b41cc: reasoning and content are published as they arrive, tool calls once from the complete
+parse (`StreamParse`); a partial parse whose content does not extend what was sent publishes no content until it
+does; a non-streaming request is parsed once instead of after every token.  **A tool call still arrives whole**, in
+one delta (name, id and full arguments) when the message ends; the text before a call streams.
+`make test-chat-parser` now feeds seven responses a character at a time (reasoning on and off, tools declared and
+not called, text before a call, one and two calls) and requires the pieces to add up to the whole parse, the answer
+to arrive in many deltas and each call in one; it passes on the IQ3_XXS and Q4_K_XL files.  The ticket's request on
+the final binary: 200 content chunks of 203 (was 1 of 3).
+
+**The checks.**  VM 221, binary sha256 `46c5747f23dcbdeb` (c3b41cc), `--mtp qwen36-mtp-draft --ctx 262144 --threads
+8 ... -- --kv q4_0`, greedy, client and server on the VM (`/models/work/serve/a5-20261013/`: `a5.py`, `serve.sh`,
+one `.json` and `.log` per configuration).  All nine checks pass in all three configurations.
+
+| check | Q4_K_XL, no cap (9,980 slots) | Q4_K_XL, `--vram-cap 11264` (2,910 slots) | IQ3_XXS, `--vram-cap 6144` (809 slots) |
+| --- | --- | --- | --- |
+| (a) chat, not streamed, thinking off: "capital of France" | pass, 0.15 s | pass, 0.54 s | pass, 0.54 s |
+| (a) chat, not streamed, thinking on: 17 x 23 = 391 | pass, 314 tokens at 313 tok/s | pass, 314 at 76 | pass, 410 at 70 |
+| (b) stream, thinking on: reasoning deltas, first, largest gap | 1,087, 0.081 s, 14.1 ms | 467, 0.293 s, 92.8 ms | 418, 0.348 s, 78.6 ms |
+| (b) the same request: content deltas, first, largest gap | 89, 3.616 s, 13.8 ms | 82, 5.803 s, 61.6 ms | 53, 6.181 s, 82.3 ms |
+| (b) the same request: tokens, decode, largest gap between any two deltas | 1,179 at 303 tok/s, 14.1 ms | 552 at 83, 92.8 ms | 474 at 72, 82.3 ms |
+| (b) stream, thinking off (the ticket's request): content deltas, first, largest gap | 212 of 213 tokens, 0.076 s, 11.5 ms | 203 of 204, 0.330 s, 53.8 ms | 209 of 210, 0.345 s, 64.2 ms |
+| (c) tool round trip, not streamed: call, result, answer | pass: `get_weather {"city":"Paris"}`, `tool_calls`, then "17 C with light rain", `stop` | pass | pass |
+| (c) tool round trip, streamed | pass: reasoning 658 deltas, the call in 1 delta at 2.40 s; the answer in 14 content deltas | pass: 517 reasoning deltas, call in 1 at 5.40 s; 15 content deltas | pass: 173, call in 1 at 2.86 s; 18 content deltas |
+| (c) tools declared, not called, streamed, thinking on: content deltas, first, largest gap | 73, 2.597 s, 14.0 ms | 74, 10.318 s, 62.2 ms | 81, 12.442 s, 81.1 ms |
+| (c) the same, thinking off | 76, 0.032 s, 11.4 ms | 69, 0.067 s, 41.7 ms | 66, 0.093 s, 41.9 ms |
+| (d) three-turn chat, tokens reused of the prompt per turn | 0 / 23, 18 / 129, 124 / 172 | 0 / 23, 18 / 133, 128 / 176 | 0 / 23, 18 / 178, 173 / 246 |
+
+"First" is from the request to that delta, so with thinking on the first content delta comes after the reasoning.
+Deltas come in bursts of an accepted draft window (median gap 0.05-0.1 ms); the largest gap is one verify round,
+longer under a cap where it waits on expert misses.  No keepalive comment was needed in any run.
+
+**(d) Why the reused prefix is short, and what lifts it.**  The engine keeps a checkpoint at the last
+`<|im_start|>` of each prompt and one at the end of each reply.  The next request reuses the second only if it
+renders the reply as it was generated, and in a plain chat Qwen3.6's template does not: a reply before the last
+user message is rendered without its `<think>` block (with thinking off, without the empty `<think>\n\n</think>`
+the generation prompt carried), whether or not the client sends `reasoning_content` back.  The tokens leave the
+generated ones right after the assistant header, and the reuse is the previous prompt less its 5-token header: 18
+of 129, 124 of 172, and the 27 of 278 above.  Each turn rereads the last reply and the new message, never the older
+history.  Not an engine fault.  Two cases reuse the reply too:
+
+- a tool loop: a reply after the last user message keeps its reasoning in the template.  pi's three requests (check
+  e): 0 of 1,604, then 1,867 of 1,948 and 2,047 of 2,118;
+- `"chat_template_kwargs": {"preserve_thinking": true}` with `reasoning_content` sent back, which the front end now
+  passes to the template (3aa9eed; binary `e4d8ec0c07473e13`): four turns reuse 0 / 22, 551 / 569, 1,010 / 1,027,
+  1,365 / 1,382.  Opt-in, because the earlier reasoning then stays in the context the model reads.  Not every turn
+  hits: in two of eight such turns the re-rendered reply did not match the generated tokens (578 of 1,330; 18 of
+  1,138) and the request fell back to the header checkpoint; which replies re-tokenize differently was not traced.
+
+**(e) pi.**  pi 0.85.1 on the Mac, its own agent directory (`PI_CODING_AGENT_DIR`, the user's `~/.pi` untouched),
+provider `openai-completions` at the engine through an SSH tunnel, Q4_K_XL no cap, `pi -p --mode json`: it wrote
+`primes.py` with its `write` tool, ran it with `bash`, and reported `2 3 5 ... 71`.  Three requests, two tool calls,
+80 thinking deltas and 82 text deltas seen by pi; nothing dropped by the parser.
+
+**Tests.**  The Qwen3.6 ctest subset on the free card (`ctest -R "qwen36|vram_plan_test|pool_native_widths_test"`):
+21 of 21.  `make test-frontend` and `make test-chat-parser` pass.  The engine is untouched by these two commits, so
+no logits comparison was owed.
+
+**Seen, not chased.**  The same greedy request does not always generate the same number of tokens on one server
+(check b, thinking on, Q4 no cap: 632 tokens in one pass, 1,179 in the next, both read from token 0); with 260
+experts off the card the miss path (CPU or DMA) depends on timing.  Whether that is the whole reason is open.
+Images (mmproj) were out of scope.
