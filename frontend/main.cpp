@@ -250,6 +250,12 @@ struct Server {
                 in.enable_thinking = kw.at("enable_thinking").get<bool>();
             if (kw.contains("reasoning_effort") && kw.at("reasoning_effort").is_string())
                 in.chat_template_kwargs["reasoning_effort"] = kw.at("reasoning_effort").dump();
+            // Qwen3.6's template drops the reasoning of every reply before the last user message unless this is
+            // set; with it (and the client sending reasoning_content back) the history renders as it was
+            // generated, so the next turn reuses the checkpoint at the end of the reply, not only the one at
+            // its header
+            if (kw.contains("preserve_thinking") && kw.at("preserve_thinking").is_boolean())
+                in.chat_template_kwargs["preserve_thinking"] = kw.at("preserve_thinking").dump();
         }
         const common_chat_params cp = common_chat_templates_apply(tmpls.get(), in);
         std::string rendered = cp.prompt;
