@@ -15,7 +15,7 @@ Flash-Next service on it was stopped).  Tree `/models/work/qwen36-step4`, binary
 subset, `-full` has none.  Everything after `--` goes to the engine: `--vram-cap MiB`, `--ram-cap GiB`, `--kv
 fp16|q4_0|int8`, `--expert-cache N|auto`, `--pcie-frac F`, `--prompt-cache N`, `--vram-reserve-mib`.
 
-## Three faults found in order, all fixed on the branch
+## Faults found in order, all fixed on the branch
 
 | # | Symptom | Cause | Fix |
 | --- | --- | --- | --- |
@@ -42,6 +42,10 @@ tokens):
 | fix | Q4 | 8192 | as t5 | 9,587 | CPU only | correct, 328 tok/s |
 | fix | Q4 | 262,144 | q4_0 | 9,980 | CPU + DMA | correct, 322 tok/s |
 | fix | IQ3 | 262,144 | q4_0, `--vram-cap 11264` | 5,762 (56%) | CPU + DMA | correct, 169 tok/s; 63,526 VRAM hits of 73,553 lookups |
+
+| 4 | Pascal host (VM 211, step5-1080ti, REGINA-106): with CPU-computed misses iq3-test20 51/64 top-1, KL 0.84; Q4 52-54/64, KL 0.25; DMA misses correct; deterministic; `--spec 1` changes it | **the multi-token CPU dispatch addressed token t's activation at t x 2560 and its output row at i x 2560** (the canonical widths pulled in by `using namespace`), while the window publishes at the layer's 2048: every token after a group's first used another token's activation.  Named by the Codex review of 22d72e6; the 4090's serve looked right because its text was checked, not its logits | the dispatch at the layer's width with refusals (the commit after 22d72e6); after it on VM 211 all three IQ3 prompts 64/64 (KL 1.4e-3 / 4.8e-3 / 2.0e-3), q4-test20 62/64 KL 6e-3, q4-prime 64/64 KL 8e-4, CPU misses forced.  The ladder points taken with the old binary are rerun |
+| 5 | the 4090 sweep's `--ram-cap 12` points: "ArenaExpertSource: the expert arena needs 18.32 GiB ... memory limit is 12.00 GiB ... --mmap-experts" | the plan chose RAM copies but the arena source still pinned the whole file | the engine picks the mapped tier with profile-ranked RAM copies itself when the arena exceeds the limit or available RAM (same commit) |
+| 6 | planner (Codex review): a full-head draft pack charged 515 MiB the drafter never allocates; k8v4 undercounted the drafter's INT8 K/V by 60 MiB; a lowered context was printed but not applied | | all three in the same commit; multi-GPU helpers refused for this geometry |
 
 ## What the 4090 serves now
 
