@@ -227,6 +227,10 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   token. Upstream's tokenizer keeps it as plain text.
 - Replies are not reproducible token for token between runs or between this fork and upstream, even with
   greedy sampling, so "same output" cannot be checked by comparing text.
+  For Qwen3.6-35B-A3B the cause is traced: an expert the card does not hold is computed by a different
+  kernel on the CPU, and the cache keeps changing which experts those are for the first few requests; replies
+  diverge only where two tokens are within about 0.3 logits, and every state holds to llama.cpp's logits.
+  `--pcie-frac 1.0`, or `--adapt-every 0 --suffix-draft 0`, makes a request repeat token for token.
 - Qwen3.6-35B-A3B: between user turns the prompt cache reuses the previous prompt but not the previous reply,
   because the model's template re-renders an earlier reply without its reasoning. Tool loops reuse nearly
   everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
