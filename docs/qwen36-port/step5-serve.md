@@ -488,3 +488,34 @@ production starts.
 
 **ctest**, the branch build at d00d383 on the free card: 94 of 98 pass, `pack_load_check` skipped, and the three
 host failures (`ple_parity`, `platform_memory_test`, `expert_multi_test`).
+
+**On main.**  main at e7ae2c8 builds the same binary as 0513d5b (`5428c8d791f7a697`).  One more start of each, same
+requests, passes 3 to 5: production 90.6 tokens/s and 2,097 prompt tokens/s, main 90.4 and 2,091 (1.00, 1.00).
+
+### Both models on the one 4090, two processes
+
+One process serves one model: the front end loads one `--model`, starts one engine child, and answers every request
+with it whatever the request's `model` field says.  Two models are two processes on two ports.  Tried once, main's
+binary, Flash-Next on 18091 and Qwen3.6 IQ3_XXS at 262,144 on 18092, `--threads 8` each on 16 vCPUs:
+
+- **`--vram-cap` does not partition a card.**  It allocates a blocker of total - cap, so one capped engine holds the
+  whole card.  What works: start Flash-Next first with a fixed `--expert-cache N`, then Qwen3.6 uncapped, whose plan
+  takes what is free.  `--expert-cache 4000` gave Flash-Next 5,357 slots and 15.4 GB of the card, with 8.8 GB free;
+  Qwen3.6 then planned a 4,331 MiB fixed set and 3,187 of 10,240 expert slots (8.1 GB), 447 MiB left.  At
+  `--expert-cache 6000` (8,053 slots) 4.3 GB stayed free, below Qwen3.6's fixed set.
+- **RAM binds first on this host.**  Flash-Next alone uses 47 of 62 GB (its 40 GiB expert arena is pinned).  With
+  Qwen3.6 beside it 60 GB were used and 2 GB available; Qwen3.6 found too little to pin its 7,053 off-card experts
+  and mapped them from the file, and took 239 s to start.  No swap, no OOM kill in this run.
+- **Idle costs nothing, concurrency costs most of both.**  An idle engine shows 0% GPU.  4 prompts of 400 tokens,
+  greedy, reasoning off, tokens/s:
+
+| | Flash-Next | Qwen3.6 IQ3_XXS |
+| --- | --- | --- |
+| Alone on the card, service configuration (10,368 slots) | 90 | |
+| Alone, `--expert-cache 4000` (5,357 slots) | 54 | |
+| The other engine loaded and idle | 45 | 133 |
+| Both generating | 12 | 27 |
+
+  Requests to both at once complete without error; each engine runs at about a quarter of its speed with the other
+  idle.  Two CUDA contexts time-slice the card, each engine's verify graph spins on the GPU while it waits for its
+  host, and 16 pool workers plus two host threads share 16 vCPUs.  Not separated which of the three costs what.
