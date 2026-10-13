@@ -136,7 +136,9 @@ def main():
     ap.add_argument("--reorder", action="store_true",
                     help="rank the traces' pairs before the base's (the base, then the fill, follow); needed with a "
                          "base that already ranks every pair, where --base alone cannot change the order")
-    ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
+    # no default: the old one was data/expert-profile.bin, the Flash-Next profile UPSTREAM.md pins by hash, so a
+    # bare run overwrote it
+    ap.add_argument("--out", required=True, help="where to write the profile")
     ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default 512)")
     ap.add_argument("--n-layer", type=int, default=None,
                     help="trunk layers (default 48; with --base, the base's header decides and this must agree)")
