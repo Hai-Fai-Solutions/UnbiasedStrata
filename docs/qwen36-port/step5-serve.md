@@ -239,7 +239,8 @@ The 262,144 rows carry the q4_0 K/V against llama.cpp's F16 (mean KL 3-5e-3 wher
 1.5e-3); the K/V format is the likely reason (not isolated here), and it is in every pass alike.
 
 **For a run that must repeat.**  `--pcie-frac 1.0` (every miss on the GPU: the all-resident tokens whatever the
-cache holds, at the DMA path's cost), or `--adapt-every 0 --suffix-draft 0` (the miss set fixed, no timed policy).
+cache holds, at the DMA path's cost; only while no layer of a window has more than 16 distinct misses, past which the
+rest run on the CPU, see the REGINA-111 section at the end), or `--adapt-every 0 --suffix-draft 0` (the miss set fixed, no timed policy).
 A conversation that continues on one engine still differs from the same prompt read from token 0 on another.
 
 **Not checked.**  The 1080 Ti (VM 211, off limits); a capped Q4 or IQ3 with thousands of misses per request beyond
@@ -289,7 +290,9 @@ misses the rule.
 
 Open in the ticket: on the 4090 the resident and DMA dumps were the same bytes; here `auto` DMA and `2000` DMA differ
 from each other although the GPU computes every miss (the adaptive tier was on: 139 to 384 experts swapped in during the 64
-tokens), and no all-resident run fits this card at fp16 to compare against.
+tokens), and no all-resident run fits this card at fp16 to compare against.  Closed in the REGINA-111 section at the end: the
+`2000, DMA` column is not a GPU-only path (its logs read `CPU experts` 0.22 to 0.73 per layer), and the five misses are
+the reference's own spread.
 
 **The checks.**  `a5.py` of the 4090 section unchanged, the measured ladder's launch (`--mtp qwen36-mtp-draft-full
 --ctx 262144 --threads 8 ... -- --kv q4_0`; the 4090 table used the subset head), greedy, client and server on the VM.
@@ -332,3 +335,107 @@ No regression.
 
 **Not checked.**  pi against this card (check e); images; `--vram-cap 8192`; IQ3 at the full card through `a5.py`
 (its decode is in the speed row); the nondeterminism section's ten-request repeats on this card.
+
+## REGINA-111: the five misses on the 1080 Ti
+
+2026-10-13.  **Verdict: no fault in the engine, on either card.**  Two findings: the `2000, DMA` column above was not a
+forced path, and the two fixtures that miss are ones llama.cpp fails against itself.  No engine source changed; the
+binaries are the ones above (`a44d896ccb25ff98` on VM 211, `b1575740af995a78` on VM 221).  Material:
+`rk@192.168.50.43:/home/rk/bench/r111/` and `rk@192.168.50.151:/models/work/r111/` (`r111-*.sh` the drivers, `pos.py`
+and `dist.py` the per-position tables, `oracle_rows.py`, `SHA256.txt`).
+
+**Why two "all GPU" configurations differed.**  They were not both all GPU.  The window's PCIe share is staged in 16
+VRAM blobs (`kStagingBlobs`, `verify.hpp:358`; 8 per group when a window runs as two groups, `verify.cpp:1705`), and
+the pool sends a miss to DMA only while `fetches < P.staging_cap` (`expert_source.cpp:2100`).  A layer of a window with
+more than 16 distinct misses computes the rest on the CPU, whatever `--pcie-frac` says.  A 4-token window routes 32
+experts; with 2,399 of 10,240 slots resident that limit is reached, with 4,240 or 8,061 it is not.
+
+- `STRATA_POOL_TRACE=1` on q4-test20, `--expert-cache 2000 --pcie-frac 1.0`: 46 of 680 layer calls publish 16 fetches
+  and then run 1 to 16 CPU jobs; no call with fewer than 16 fetches runs any.  The first is window 1 (positions 1 to
+  4), layer 0: 16 by DMA, 12 on the CPU.  The first logits row that differs from the `auto` run is position 3.
+- With `--spec 2` (at most 16 routed experts a window) the log reads `CPU experts 0.00`, and the `2000` and `auto`
+  dumps are the same bytes, for both fixtures; for q4-test20 they are also the bytes of the `auto` run at `--spec 4`
+  (`790e501683ea6af6`).  The GPU path on sm_61 does not depend on what is resident or on the window's shape.
+- The 4090 does the same: `--expert-cache 2000 --pcie-frac 1.0` at `--spec 4` reads `CPU experts` 0.33 (Q4) and 0.68
+  (IQ3) per layer and its dumps differ from the all-resident ones; at `--spec 2` they are the all-resident bytes
+  (`e4e5fdc81b4bc604`, `de2fd0e08c2e6679`).  The earlier resident-against-DMA identity there was measured at
+  `--expert-cache 8000`, which never reaches 16 misses.  Nothing here is specific to Pascal.
+
+So in the A5 table the `auto, DMA` column is the GPU path (`CPU experts 0.00` in all six logs) and the `2000, DMA`
+column is the GPU path with 0.22 to 0.73 CPU-computed experts per layer mixed in.  A run meant to force the GPU path
+has to show `CPU experts 0.00`; `--spec 2` guarantees it.
+
+**The soft positions.**  The fixtures' reference is llama.cpp on the 4090, every layer offloaded.  The same pinned
+llama.cpp was teacher-forced along the same ids on VM 211, once with no layer offloaded (`--ngl 0`, "CPU" below) and once on the 1080 Ti with
+what fits (28 of 41 layers for IQ3, 15 of 42 for Q4), and `ref/qwen36.py` (the numpy oracle: F32 weights as
+dequantized, F32 activations, its own routing) was run over prompt and continuation in one pass, plain and with
+`--act-quant q8`.  Each run against the fixture's reference, and against the F32 oracle (top-1 of 64, mean KL, the
+largest KL and its position; **bold** misses the rule's thresholds):
+
+| run | q4-test20 vs llama.cpp 4090 | q4-test20 vs F32 oracle | iq3-prime-add vs llama.cpp 4090 | iq3-prime-add vs F32 oracle |
+| --- | --- | --- | --- | --- |
+| llama.cpp, the 4090 (the reference) | - | **61**, 6.1e-3, 0.141 (8) | - | 64, 7.6e-3, 0.316 (40) |
+| llama.cpp, CPU | **60**, 9.2e-3, 0.174 (8) | 63, 5.5e-3, 0.079 (8) | 62, **2.72e-2**, 1.400 (40) | 62, **1.48e-2**, 0.626 (40) |
+| llama.cpp, the 1080 Ti, partly offloaded | **60**, 9.9e-3, 0.199 (8) | 63, 5.7e-3, 0.087 (8) | 62, **2.70e-2**, 1.368 (40) | 62, **1.31e-2**, 0.570 (40) |
+| engine, 1080 Ti, GPU only (`auto`, DMA) | **61**, 8.5e-3, 0.138 (8) | 64, 4.3e-3, 0.050 (10) | 64, **1.26e-2**, 0.416 (40) | 64, 4.5e-3, 0.066 (48) |
+| engine, 1080 Ti, `auto`, CPU misses | 62, 6.0e-3, 0.049 (10) | 62, 7.0e-3, 0.161 (8) | 64, 4.5e-3, 0.062 (54) | 64, 5.9e-3, 0.244 (40) |
+| engine, 1080 Ti, `2000`, GPU with the CPU overflow | 62, **1.17e-2**, 0.323 (8) | 63, 6.5e-3, 0.122 (8) | 63, **1.18e-2**, 0.467 (40) | 63, 7.4e-3, 0.141 (40) |
+| engine, 1080 Ti, `2000`, CPU misses | **61**, 8.3e-3, 0.086 (8) | 62, 5.7e-3, 0.083 (8) | 64, 4.8e-3, 0.073 (45) | 64, **1.22e-2**, 0.612 (40) |
+| engine, 4090, all resident | **61**, 7.4e-3, 0.147 (8) | 64, 3.8e-3, 0.040 (8) | 64, 6.6e-3, 0.152 (40) | 64, 3.5e-3, 0.082 (40) |
+| Q8 oracle | | 63, 7.5e-3, 0.109 (8) | | 64, 7.6e-3, 0.186 (45) |
+
+llama.cpp on another back end misses the rule against its own 4090 run on both fixtures, by more than any engine run
+does.  Against the F32 oracle the engine's GPU path is inside the thresholds on both cards (1080 Ti 64 of 64 at 4.3e-3
+and 4.5e-3; 4090 64 of 64 at 3.8e-3 and 3.5e-3) and nearer the oracle than the reference is (61 at 6.1e-3; 64 at
+7.6e-3).  The 1080 Ti is 0.5e-3 and 1.0e-3 farther from the oracle than the 4090, 64 of 64 on both.
+
+The positions themselves (margins are logits, first candidate minus second; KL against the reference / the F32 oracle):
+
+| position | llama.cpp 4090 | llama.cpp CPU | llama.cpp 1080 Ti | engine 1080 Ti, GPU only | engine 4090, resident | F32 oracle |
+| --- | --- | --- | --- | --- | --- | --- |
+| q4-test20, 8: " operation" / " expression" / " list"; entropy 4.2 nats | " operation" by 0.21 (p 0.21 / 0.17); - / 0.141 | " list"; 0.174 / 0.079 | " list"; 0.199 / 0.087 | " list"; 0.138 / 0.029 | " list"; 0.147 / 0.040 | " list" (p 0.15) |
+| q4-test20, 9: ":" / "?" | ":" by 0.15 | "?" by 0.14 | "?" by 0.18 | "?" by 0.27 | "?" by 0.30 | "?" by 0.13 |
+| q4-test20, 13: " Extract" / " Take" | " Extract" by 0.13 | " Take" by 0.08 | " Take" by 0.12 | " Take" by 0.28 | " Take" by 0.20 | " Take" by 0.07 |
+| iq3-prime-add, 40: "user" / `<\|im_start\|>` | "user" by 2.70 (p 0.86); - / 0.316 | `<\|im_start\|>` by 1.57; 1.400 / 0.626 | `<\|im_start\|>` by 1.26; 1.368 / 0.570 | "user" by 0.30; 0.416 / 0.053 | "user" by 0.96; 0.152 / 0.082 | "user" by 0.77 (p 0.55) |
+
+At q4-test20 positions 8, 9 and 13 every other source, the F32 oracle included, picks what the engine picks: the three
+"misses" are the 4090 llama.cpp run standing alone at near ties.  iq3-prime-add position 40 is the fifth token after
+the reply's `<|im_end|>` (position 35), in `<|im_end|>\n<|endoftext|><|im_start|><|im_start|>user`: text no request
+is ever served, where llama.cpp's own back ends differ by 4.3 logits on the margin (+2.70 to -1.57) and the engine sits
+between them, next to the oracle.  On that fixture positions 0 to 35 read mean KL 2.7e-3 (largest 0.025) for the 1080
+Ti's GPU path and 3.4e-3 (0.071) for the 4090; positions 36 to 63 read 2.5e-2 and 1.1e-2, and llama.cpp's CPU run
+5.5e-2.
+
+**Is 0.4 at one position acceptable.**  Per-position KL against the reference, the 24 runs of the table above and
+the 4090's six: the median is 1e-6 to 2.5e-3 in every run and the 90th percentile at most 2.4e-2.  17 of 30 runs
+have no position above 0.05.  Positions above 0.1 exist only on these two fixtures: position 8 of q4-test20 (0.138 to
+0.323 in three of five runs) and positions 40, 42 and 48 of iq3-prime-add (0.416, 0.128, 0.119 in the GPU-only run;
+0.467 with the overflow; 0.152 on the 4090).  With its largest position left out no run's mean is above 7.1e-3.  A KL
+of 0.4 at a position where two llama.cpp back ends are 1.4 apart measures the reference, not the engine; the same
+0.4 at a position where they agree to 1e-2 would be a fault; no position of the other four fixtures is above 0.1.
+
+**Proposed for the rule, not adopted** (the thresholds 62 of 64 and 1e-2 stand as written until decided):
+
+1. Score positions up to and including the reference's first stop token only (36 of 64 on iq3-prime-add; the other five
+   fixtures do not stop), or regenerate that fixture to hold 64 positions before the stop.
+2. Keep a second llama.cpp run per fixture (`--ngl 0`, forced along the same ids; under half a minute each) and
+   report, not gate, the positions where the two llama.cpp runs disagree on top-1 or differ by more than 0.05 KL, as
+   the runner tests already do where the F32 and Q8 oracles disagree.  q4-test20 loses positions 6, 8, 9, 13, 15;
+   iq3-prime-add loses 0, 2, 8, 40.  The thresholds become shares of what is left (96.9% and 1e-2).
+3. A forced-GPU run counts only with `CPU experts 0.00` in its log.
+
+With 1 and 2 all eight 1080 Ti runs of the two fixtures pass: q4-test20 59 of 59 in each, mean KL 5.2e-3 to 5.8e-3;
+iq3-prime-add 33 of 33 in each, 8.9e-4 to 2.1e-3.
+
+**Left as it is, for a decision.**  `--pcie-frac 1.0` does not force the GPU past 16 distinct misses per layer and
+window (8 per group).  README line 232 and the paragraph "For a run that must repeat" above promise repeats from that
+flag; with a small cache (the 1080 Ti at `--expert-cache 2000`, or a `--vram-cap` configuration) the overflow runs
+on the CPU and the adaptive tier can then move a request between passes as in the CPU rows of that section.  Sizing the
+staging to the window (8 blobs per token: 16 more at 4 tokens, under 58 MiB at Q4) would make the flag exact; it also moves
+the default share's ceiling, so it changes what the ladder measured and was not done here.
+
+**Not checked.**  A Pascal-against-Ada bisect by layer: the two cards run different kernels from the prompt on (the
+BF16 GEMM through fp32 and no tensor-core MoE on sm_61), so they are not expected to agree in bytes, and each agrees
+with the F32 oracle to 4e-3; the other four fixtures against the oracle or a second llama.cpp run; llama.cpp fully
+offloaded on a second card (neither file fits the 1080 Ti); whether the overflow makes a served request differ between
+passes (inferred from the CPU rows above, not run); the 262,144 q4_0 configuration.
