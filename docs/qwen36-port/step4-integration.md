@@ -48,5 +48,9 @@ The expected `generate.cpp` conflict between the drafter's draft-geometry hunk (
 2. The 1080 Ti real-file comparison (sync `/models/work/qwen36-step4-teacher` to VM 211) and the Q4 fit at 11 GB.
 3. The ladder: serve and measure on 11 GB, then `--vram-cap` 8 and 6 GB; the three instruments; engine points on
    `ladder-baseline.png`; acceptance A1-A5.
-4. The step-6 fat binary (`CUDA_ARCHS=61;70;75;86;89;120`, `STRATA_EXPERIMENTAL_SM60=ON`) is being compile-checked
-   on VM 221's CPU in `build-fat` (`/models/work/logs/qwen36-step4-fat-*.log`); no GPU needed for the check.
+4. The step-6 fat binary, compile-checked on VM 221's CPU (`build-fat`, `/models/work/logs/qwen36-step4-fat-*.log`):
+   `CUDA_ARCHS=61;70;75;86;89` with `STRATA_EXPERIMENTAL_SM60=ON` and `STRATA_MMQ_KQUANTS=ON` configures and builds
+   `unbiased-strata` in 6 min 17 s at `-j 14`, 0 errors; `cuobjdump --list-elf` shows 62 ELF images per architecture
+   for all five; 235 MiB.  **sm_120 cannot come from this host**: CUDA 12.4's nvcc rejects `compute_120`
+   ("Unsupported gpu architecture"); Blackwell needs a 12.8+ toolkit, so the step-6 release build either uses a newer
+   toolkit or ships 120 as PTX from 89.  Nothing in this binary has run on a card yet.
