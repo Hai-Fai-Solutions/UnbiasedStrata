@@ -19,7 +19,7 @@ Hardware: Linux, x86-64 with AVX2, one NVIDIA card.
 | Model | Card | RAM |
 | --- | --- | --- |
 | Qwen3.8-Flash-Next | 24 GB or more (RTX 30, 40 or 50) | 128 GB |
-| Qwen3.6-35B-A3B | 6 to 32 GB, Pascal (GTX 10 series, sm_61) or newer, one card | 12 GB at 11 GB of VRAM; less VRAM needs more RAM or a faster disk (the sizing rule below) |
+| Qwen3.6-35B-A3B | 6 to 32 GB, Pascal (GTX 10 series, sm_61) or newer, one card | enough to hold the experts the card does not: 32 GB for Q4_K_XL on an 11 GB card, 16 GB for IQ3_XXS (the table under Sizing) |
 
 The model can be on a local disk or on a network volume; what the card does not hold is read into RAM at
 start, and what RAM does not hold is read from the file on a miss, so a slow store costs start-up time and,
@@ -136,6 +136,24 @@ plan like a small one.
 
 The 24 GB row is measured; the others are the planner's figures from the same files under `--vram-cap`
 (docs/qwen36-port/step2-notes.md section 5, step4-pack.md section 5).
+
+**RAM is part of the hierarchy, not a convenience.** The engine is fast when every expert the card does not hold
+is pinned in RAM, and it is disk-bound when they are not: measured on the GTX 1080 Ti at Q4_K_XL, 262,144
+context, the same point decodes at 52 tokens/s with the expert set in RAM and at 12 to 15 tokens/s under a 12 GiB
+memory bound, where about 12 experts per token come off the NVMe (llama.cpp does 13.4 there). IQ3_XXS fits the
+two tiers on that card and keeps 56 tokens/s under the same bound. What the host must hold is the expert bytes
+minus the card's share, plus the engine's own 3 to 4 GB and the OS:
+
+| VRAM | Q4_K_XL experts off the card | RAM to have | IQ3_XXS experts off the card | RAM to have |
+| --- | --- | --- | --- | --- |
+| 24 GB | none | 8 GB | none | 8 GB |
+| 16 GB | 8 GB | 16 GB | none | 8 GB |
+| 11 GB | 13 GB | 32 GB (24 is tight) | 4 GB | 12 GB |
+| 8 GB | 15 GB | 32 GB | 7 GB | 16 GB |
+| 6 GB | 17 GB | 32 GB | 9 GB | 16 GB |
+
+Below those figures the engine still starts (it maps the rest from the file and says so in its plan), but the
+decode rate is the disk's.
 
 ## Status
 
