@@ -677,10 +677,16 @@ int main(int argc, char** argv) {
     }
 
     std::fprintf(stderr, "unbiased-strata: loading the model (this takes a few minutes)...\n");
-    if (!srv.engine.wait_ready(err)) {
+    long long engine_ctx = 0;
+    if (!srv.engine.wait_ready(err, &engine_ctx)) {
         std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str());
         srv.engine.quit();
         return 1;
+    }
+    if (engine_ctx > 0 && engine_ctx != o.ctx) {   // the engine's VRAM plan lowered the context: serve that one
+        std::fprintf(stderr, "unbiased-strata: the engine allocated a context of %lld tokens, not the %lld requested; "
+                             "requests are bounded by %lld\n", engine_ctx, o.ctx, engine_ctx);
+        o.ctx = engine_ctx;
     }
 
     httplib::Server http;

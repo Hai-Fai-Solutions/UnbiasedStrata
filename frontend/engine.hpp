@@ -46,11 +46,19 @@ public:
         return out_ != nullptr;
     }
 
-    /// Reads the engine's start-up lines until it says READY.  Loading the model takes minutes.
-    bool wait_ready(std::string& err) {
+    /// Reads the engine's start-up lines until it says READY.  Loading the model takes minutes.  The READY line
+    /// carries the context the engine actually allocated (`READY <max_context> stop`): its VRAM plan may have
+    /// lowered the request, and the front end's request limit and /v1/models follow that figure, not --ctx.
+    bool wait_ready(std::string& err, long long* context = nullptr) {
         std::string line;
         while (read_line(line)) {
-            if (line.rfind("READY", 0) == 0) return true;
+            if (line.rfind("READY", 0) == 0) {
+                if (context != nullptr) {
+                    const long long n = std::atoll(line.c_str() + 5);
+                    if (n > 0) *context = n;
+                }
+                return true;
+            }
             if (line.rfind("ERR", 0) == 0) { err = line; return false; }
         }
         err = "the engine exited before it was ready (its messages are above)";

@@ -2282,7 +2282,9 @@ int main(int argc, char** argv) {
         // file and the hottest ones by profile rank are copied into RAM (the --resident-experts mode), which is what
         // the plan's "expert copies in RAM" line already assumed.  Chosen here, before anything keys on the mode;
         // an explicit --mmap-experts / --resident-experts is left alone.
-        if (!o.mmap_experts) {
+        if (!o.mmap_experts && o.shared_expert_arena.empty() && o.peer_device < 1 && !o.remote_expert_opt) {
+            // (an explicit shared arena keeps its own pages; the multi-GPU helpers' residency rules were validated at
+            // option time and are not revisited here)
             const auto& lay2 = strata::kernels::cpu::expert_layout();
             strata::core::detail::HostMemory hm;
             if (lay2.native && lay2.total > 0 && strata::core::detail::host_available_memory(hm)) {

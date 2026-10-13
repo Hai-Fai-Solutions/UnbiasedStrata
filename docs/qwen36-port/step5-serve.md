@@ -47,6 +47,8 @@ tokens):
 | 5 | the 4090 sweep's `--ram-cap 12` points: "ArenaExpertSource: the expert arena needs 18.32 GiB ... memory limit is 12.00 GiB ... --mmap-experts" | the plan chose RAM copies but the arena source still pinned the whole file | the engine picks the mapped tier with profile-ranked RAM copies itself when the arena exceeds the limit or available RAM (same commit) |
 | 6 | planner (Codex review): a full-head draft pack charged 515 MiB the drafter never allocates; k8v4 undercounted the drafter's INT8 K/V by 60 MiB; a lowered context was printed but not applied | | all three in the same commit; multi-GPU helpers refused for this geometry |
 
+| 7 | second Codex review of fa69e82: the front end kept validating and advertising the requested `--ctx` when the engine's plan lowered it; the automatic mapped tier ignored an explicit `--shared-expert-arena` and the multi-GPU residency rules; the plan's session term keeps the RoPE table at the requested context | | the front end takes the context from the engine's `READY <n>` line and bounds requests by it; the automatic choice is skipped with a shared arena or the helpers.  The RoPE table at a lowered context is left as a conservative overcount (at most 32 MiB from 262,144 to 131,072), noted here rather than threaded through the plan |
+
 ## What the 4090 serves now
 
 | file | ctx | fixed set | experts resident | VRAM free after load | short answer decode | drafts accepted |
