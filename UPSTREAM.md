@@ -98,7 +98,7 @@ higher acceptance, 345 MiB more VRAM for the head). Building twice gives the sam
 
 ```
 9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe  Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
-QWEN36_Q4_PLAIN_SHA  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (the -MTP repository's file)
 7c20e11993ff853fe5698843d610b2a87927b04f9a4607551f4e023a39bc71ba  qwen36-q4/conversions.json
 53467f9b49bbc57d570eb8802125144dd4b4d7fd6a658d685ef72005d75a5f4f  qwen36-q4/dense.bin

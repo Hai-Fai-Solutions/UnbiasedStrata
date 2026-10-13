@@ -107,7 +107,7 @@ quantizations, with the pack and draft pack made by this repository's own tools 
 
 | What | Size | SHA-256 |
 | --- | --- | --- |
-| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, **the default** (K-quants: the fast AVX2 path for the experts the CPU computes) | 22.36 GB | `QWEN36_Q4_PLAIN_SHA` |
+| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, **the default** (K-quants: the fast AVX2 path for the experts the CPU computes) | 22.36 GB | `707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450` |
 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` from the **-MTP** repository (the same trunk plus the draft block `blk.40`; serves as the model file too) | 22.85 GB | `55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1` |
 | `Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`, for 6 and 8 GB cards | 13.21 GB | `9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe` |
 | Pack `qwen36-q4/` or `qwen36-iq3/` (`index.txt`, `dense.bin`, `native_experts.txt`, `conversions.json`, `expert-profile.bin`, `tokenizer/`) | 65 MB | per file in UPSTREAM.md |
@@ -172,9 +172,41 @@ Qwen3.6-35B-A3B, checked on the RTX 4090 (VM, 16 vCPU i9-9900K, 62 GB RAM, CUDA 
 | --- | --- |
 | Correctness | the engine's logits held to a numpy reference and to llama.cpp at every position of the real files (greedy top-1 64/64 on three prompts at IQ3_XXS, 61-64/64 at Q4_K_XL, mean KL 1e-3 to 7e-3); the expert-miss path (what every card below 24 GB runs on) held with the same prompts under `--vram-cap` |
 | Serving | chat, streaming, reasoning, tool calls, multi-turn prompt checkpoints at 262,144 context; both quantizations |
-| Speed, short answers | 320-360 tokens/s with the draft head (IQ3_XXS and Q4_K_XL, every expert resident); 169 tokens/s at IQ3_XXS under an 11 GB cap (56% of the experts resident) |
-| The ladder (6 to 24 GB, both quantizations, against the llama.cpp baseline) | measured on the 4090 under `--vram-cap`; the table and plots are in the regina repository's `analysis/qwen36-35b-single-gpu-ladder/engine-4090/` |
-| Pascal | built and unit-tested on a GTX 1080 Ti (sm_61: every kernel parity test, the pack, the drafter, the verify window); serving there is not measured yet (the card was in use) |
+| Pascal | built and unit-tested on a GTX 1080 Ti (sm_61: every kernel parity test, the pack, the drafter, the verify window); the expert-miss path held to llama.cpp's logits there too |
+
+Speed against llama.cpp on the same card (RTX 4090, `--vram-cap` for the smaller budgets, 262,144 context,
+no RAM cap, drafter on; llama.cpp with `--n-cpu-moe N` chosen to fit the same budget, no speculation). Decode
+is a 1,200-token answer to a 2.4K prompt; prefill is a 32K prompt. Tokens/s, engine / llama.cpp:
+
+| Budget | Q4_K_XL decode | Q4_K_XL prefill | IQ3_XXS decode | IQ3_XXS prefill |
+| --- | --- | --- | --- | --- |
+| 24 GB | 251 / 159 (1.6x) | 4,319 / 8,604 (0.50x) | 318 / 167 (1.9x) | 4,426 / 8,245 (0.54x) |
+| 16 GB | 180 / 41 (4.4x) | 4,232 / 1,798 (2.4x) | 319 / 44 (7.3x) | 4,401 / 2,637 (1.7x) |
+| 12 GB | 122 / 38 (3.3x) | 3,877 / 1,475 (2.6x) | 256 / 40 (6.4x) | 4,381 / 2,223 (2.0x) |
+| 11 GB | 104 / 37 (2.8x) | 3,723 / 1,420 (2.6x) | 234 / 39 (6.1x) | 4,375 / 2,137 (2.1x) |
+| 8 GB | 64 / 33 (2.0x) | 3,003 / 1,212 (2.5x) | 135 / 34 (4.0x) | 4,320 / 1,854 (2.3x) |
+| 6 GB | 45 / 30 (1.5x) | 517 / 1,108 (0.47x) | 81 / 32 (2.5x) | 1,121 / 1,713 (0.65x) |
+
+The llama.cpp 24 GB Q4_K_XL row is at 131,072 context; it does not load at 262,144 with every layer on the card.
+Prompt processing is the weak side: with every expert resident llama.cpp is twice as fast, and at 6 GB the engine
+spends the prompt copying experts to the card. Full tables, profiler windows and plots are in the regina
+repository's `analysis/qwen36-35b-single-gpu-ladder/engine-4090/`.
+
+On the GTX 1080 Ti (VM, 14 vCPU of a Ryzen 7 1700, 52 GB RAM), 262,144 context at every budget, decode tokens/s
+for the same 1,200-token answer:
+
+| Budget | Q4_K_XL | IQ3_XXS |
+| --- | --- | --- |
+| 11 GB (the card) | 66 | 81 |
+| 8 GB (`--vram-cap 8192`) | 54 | 69 |
+| 6 GB (`--vram-cap 6144`) | 42 | 55 |
+
+llama.cpp on this card was measured earlier in a 12 GiB VM: 32.5, 28.2 and 20.6 at IQ3_XXS for the three budgets
+(2.5x to 2.7x), and 13.4, 9.4 and 6.8 at Q4_K_XL, where it was reading experts from the NVMe. The Q4_K_XL comparison
+with both engines in RAM is not measured yet. The engine under the same 12 GiB bound decodes Q4_K_XL at 18.8.
+The draft head is worth a third: 49 tokens/s without drafts at Q4_K_XL on the full card. Prompt speed on this card
+is 900 to 940 tokens/s on a 3.1K prompt and 440 to 460 on a 32K prompt (361 and 265 for Q4_K_XL at 6 GB). Tables and
+plots: regina `analysis/qwen36-35b-single-gpu-ladder/engine-1080ti/`.
 
 Speed, one run of each, same machine and model files, greedy sampling, reasoning off. Generation is the mean
 of 8 different prompts of 400 tokens; prompt speed is the mean of 2 different prompts of about 20,000 tokens.
@@ -197,7 +229,8 @@ builds differ in compile flags and in how the n-gram table is held in RAM, and e
   greedy sampling, so "same output" cannot be checked by comparing text.
 - Qwen3.6-35B-A3B: the multi-turn checkpoint reuses a shorter prefix than the previous turn's length (27 of
   278 tokens in one two-turn test); images are not wired; the RTX 50 and Volta builds have not run on a
-  card.
+  card; with `stream` on, the answer's text arrives as one delta after the reasoning (the reasoning streams
+  per token); prompt processing is slower than llama.cpp with every expert on the card and at 6 GB.
 
 ## Compared with upstream Strata (6f32ec0)
 
