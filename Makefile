@@ -17,7 +17,7 @@ build:
 	@git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>/dev/null || \
 	  git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
-	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(CMAKE_EXTRA)
+	      -DSTRATA_PORTABLE=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(CMAKE_EXTRA)
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target unbiased-strata
 	@echo "built: $(BUILD_DIR)/unbiased-strata"
 

@@ -1142,6 +1142,23 @@ if(STRATA_NATIVE_EXPERTS)
   if(NOT EXISTS ${STRATA_GGML_DIR}/ggml/CMakeLists.txt)
     message(FATAL_ERROR "ggml was not found in ${STRATA_GGML_DIR}: run `git submodule update --init` first")
   endif()
+  # The chat-parser patch (patches/llama.cpp-qwen3-coder-any-argument-order.patch) is applied here at configure
+  # time, not only by `make build`: a tree built with cmake directly (the VMs, the agents' worktrees, a copied
+  # submodule without .git) otherwise runs upstream's required-first rule and drops a Qwen3.6 tool call whose
+  # required parameter is not written first (REGINA-104).
+  set(_strata_patch ${CMAKE_CURRENT_SOURCE_DIR}/patches/llama.cpp-qwen3-coder-any-argument-order.patch)
+  if(STRATA_GGML_DIR STREQUAL ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp AND EXISTS ${_strata_patch})
+    execute_process(COMMAND patch -p1 -N -R --dry-run -s -i ${_strata_patch} WORKING_DIRECTORY ${STRATA_GGML_DIR}
+                    RESULT_VARIABLE _strata_patched OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _strata_patched EQUAL 0)
+      execute_process(COMMAND patch -p1 -N -s -i ${_strata_patch} WORKING_DIRECTORY ${STRATA_GGML_DIR}
+                      RESULT_VARIABLE _strata_patch_rc OUTPUT_VARIABLE _strata_patch_out ERROR_VARIABLE _strata_patch_out)
+      if(NOT _strata_patch_rc EQUAL 0)
+        message(FATAL_ERROR "could not apply ${_strata_patch} to ${STRATA_GGML_DIR}:\n${_strata_patch_out}")
+      endif()
+      message(STATUS "applied patches/llama.cpp-qwen3-coder-any-argument-order.patch to third_party/llama.cpp")
+    endif()
+  endif()
   add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
