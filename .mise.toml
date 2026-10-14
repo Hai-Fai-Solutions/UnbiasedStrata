@@ -26,8 +26,8 @@ description = "Generate both trunk and draft packs"
 depends = ["packs:generate-trunk", "packs:generate-mtp"]
 
 [tasks."build"]
-description = "Build unbiased-strata"
-run = "make -C build"
+description = "Configure and build unbiased-strata"
+run = "cmake -S . -B build && cmake --build build"
 
 [tasks."serve:start"]
 description = "Start Strata API server (foreground; use serve:start-bg for background)"
