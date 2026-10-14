@@ -50,6 +50,8 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "4000:4000"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
