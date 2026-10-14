@@ -1,4 +1,6 @@
-# UnbiasedStrata (PR feat/custom-model) — Operations Manual
+# Operations Manual — UnbiasedStrata with Qwen3.6 (PR branch)
+
+> Side note: This manual documents work based on PR [robertkarl/UnbiasedStrata#3](https://github.com/robertkarl/UnbiasedStrata/pull/3), which permits running other quantizations such as `UD-Q4_K_XL`.
 
 ## Prerequisites
 - This repo checked out in the branch that contains this manual (mise tasks and configs are provided there)
