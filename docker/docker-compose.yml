@@ -27,7 +27,7 @@ services:
       SALT: ${SALT}
       # Langfuse web UI port inside the container.
       PORT: "3000"
-      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
     ports:
       - "3000:3000"
     healthcheck:
