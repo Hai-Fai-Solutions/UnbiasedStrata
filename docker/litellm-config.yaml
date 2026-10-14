@@ -1,0 +1,13 @@
+model_list:
+  - model_name: qwen3.6-35b-a3b-ud-q4_k_xl
+    litellm_params:
+      model: openai/qwen3.6-35b-a3b-ud-q4_k_xl
+      api_base: http://host.docker.internal:8080/v1
+      api_key: local
+
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+
+general_settings:
+  master_key: sk-local-litellm
