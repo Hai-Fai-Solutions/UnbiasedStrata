@@ -23,8 +23,8 @@ services:
     environment:
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
       # Generate random secrets before production use.
-      NEXTAUTH_SECRET: chaangeme_nextauth_secret
-      SALT: chaangeme_salt
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SALT: ${SALT}
       # Langfuse web UI port inside the container.
       PORT: "3000"
       NEXTAUTH_URL: http://localhost:3000

@@ -1,2 +1,5 @@
-/build*/
-*.log
+# secrets
+.env
+docker/.env
+# local env
+*.env.local
