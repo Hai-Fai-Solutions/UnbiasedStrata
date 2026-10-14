@@ -80,12 +80,14 @@ bool file_exists(const std::string& p) {
     return ::stat(p.c_str(), &st) == 0;
 }
 
-/// The model name the API reports: the base name of the first shard up to "-00001-of-", in lower case.
+/// The model name the API reports: the base name of the model, lower-cased.
 std::string model_name(const std::string& shard1) {
     std::string name = shard1.substr(shard1.rfind('/') + 1);
-    name.resize(std::min(name.size(), name.rfind("-00001-of-")));
+    auto at = name.rfind("-00001-of-");
+    if (at != std::string::npos) name.resize(at);
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0) name.resize(name.size() - 5);
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-    return name;
+    return name.empty() ? std::string("unbiased-strata") : name;
 }
 
 // ---------------------------------------------------------------------------------------------------- the engine
@@ -652,14 +654,7 @@ int main(int argc, char** argv) {
     Server srv;
     Options& o = srv.opt;
     if (!parse_args(argc, argv, o)) { usage(); return 2; }
-    g_model_name = model_name_of(o.model);
-
     // every file the engine needs must already be here: nothing is fetched
-    if (o.model.find("-00001-of-") == std::string::npos) {
-        std::fprintf(stderr, "unbiased-strata: --model must be the first shard (...-00001-of-0000N.gguf); "
-                             "the other shards must be beside it\n");
-        return 2;
-    }
     srv.model_name = model_name(o.model);
     const std::string profile = o.pack + "/expert-profile.bin";
     for (const std::string& f : {o.model, o.pack + "/index.txt", profile, o.mtp + "/experts.bin",
@@ -675,7 +670,6 @@ int main(int argc, char** argv) {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
         "--mtp", o.mtp, "--max-context", std::to_string(o.ctx)};
-    if (!shard2.empty()) { eargs.push_back("--ple-gguf"); eargs.push_back(shard2); eargs.push_back("--ple-io"); eargs.push_back("ram"); }
     if (o.vram_cap_mib > 0) { eargs.push_back("--vram-cap"); eargs.push_back(std::to_string(o.vram_cap_mib)); }
     if (o.ram_cap_gib > 0.0) { eargs.push_back("--ram-cap"); eargs.push_back(std::to_string(o.ram_cap_gib)); }
     if (!o.mmproj.empty()) eargs.push_back("--vision");

@@ -1,0 +1,42 @@
+[env]
+MODEL_DIR = "{{config_root}}/models"
+
+[tasks."mtp:download"]
+description = "Download the Qwen3.6 GGUF base and MTP GGUF models"
+run = """
+set -e
+mkdir -p "$MODEL_DIR" "$MODEL_DIR/.base" "$MODEL_DIR/.mtp"
+hf download unsloth/Qwen3.6-35B-A3B-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir "$MODEL_DIR/.base"
+hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir "$MODEL_DIR/.mtp"
+mv -f "$MODEL_DIR/.base/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" "$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+mv -f "$MODEL_DIR/.mtp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" "$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf"
+rmdir "$MODEL_DIR/.base" "$MODEL_DIR/.mtp" 2>/dev/null || true
+"""
+
+[tasks."packs:generate-trunk"]
+description = "Generate trunk pack from the base GGUF"
+run = "python3 -I tools/iq_pack.py --gguf \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --out \"$MODEL_DIR/qwen36-q4\""
+
+[tasks."packs:generate-mtp"]
+description = "Generate draft pack from the MTP GGUF"
+run = "python3 -I tools/mtp_qwen36_pack.py --gguf \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf\" --out \"$MODEL_DIR/qwen36-mtp-draft\" --draft-vocab data/draft_vocab.bin"
+
+[tasks."packs:generate"]
+description = "Generate both trunk and draft packs"
+depends = ["packs:generate-trunk", "packs:generate-mtp"]
+
+[tasks."serve:start"]
+description = "Start Strata API server (foreground; use serve:start-bg for background)"
+run = "./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 0 --mtp-max-t 0"
+
+[tasks."serve:start-bg"]
+description = "Start Strata API server in background, logging to strata.log"
+run = "nohup ./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 0 --mtp-max-t 0 > strata.log 2>&1 & echo $! > strata.pid"
+
+[tasks."mtp:serve:start"]
+description = "Alias for serve:start"
+depends = ["serve:start"]
+
+[tasks."mtp:serve:start-bg"]
+description = "Alias for serve:start-bg"
+depends = ["serve:start-bg"]
