@@ -26,8 +26,9 @@ description = "Generate both trunk and draft packs"
 depends = ["packs:generate-trunk", "packs:generate-mtp"]
 
 [tasks."build"]
-description = "Configure and build unbiased-strata (uses Makefile for CUDA flags and patching)"
+description = "Configure and build unbiased-strata (make on Linux, CMake on Windows)"
 run = "make build"
+run_windows = "git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>nul || git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF && cmake --build build --config Release --target unbiased-strata"
 
 [tasks."build:windows"]
 description = "Configure and build unbiased Strata on Windows (Visual Studio generator)"
