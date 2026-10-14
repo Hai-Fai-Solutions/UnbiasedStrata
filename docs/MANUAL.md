@@ -100,20 +100,6 @@ Access:
 
 This configuration was verified against Strata using the OpenAI-compatible provider. Set `reasoning_effort` in request/model settings if you want thinking enabled (`"high"`), or omit/`"none"` for plain `content`.
 
-## Observability stack (moved out)
-
-The Langfuse + LiteLLM stack now lives in a separate repo:
-`../Strata-Observability` (see its `README.md`).
-
-Quickstart there:
-```bash
-cd ../Strata-Observability
-cp .env.example .env   # fill secrets + Langfuse keys
-docker compose up -d
-```
-
-Point clients to LiteLLM (`http://<host>:4000/v1`) when enabled; otherwise use Strata directly at `:8080`.
-
 ## Firewall
 
 UFW (if enabled):
