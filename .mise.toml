@@ -29,6 +29,10 @@ depends = ["packs:generate-trunk", "packs:generate-mtp"]
 description = "Configure and build unbiased-strata (uses Makefile for CUDA flags and patching)"
 run = "make build"
 
+[tasks."build:windows"]
+description = "Configure and build unbiased Strata on Windows (Visual Studio generator)"
+run = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF && cmake --build build --config Release --target unbiased-strata"
+
 [tasks."serve:start"]
 description = "Start Strata API server (foreground; use serve:start-bg for background)"
 run = "./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 2 --mtp-max-t 2"
