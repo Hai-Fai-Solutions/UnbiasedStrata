@@ -100,6 +100,22 @@ Access:
 
 This configuration was verified against Strata using the OpenAI-compatible provider. Set `reasoning_effort` in request/model settings if you want thinking enabled (`"high"`), or omit/`"none"` for plain `content`.
 
+## Windows notes
+
+This repo’s `make build` and mise tasks are Linux-focused. On Windows, configure/build with CMake (Visual Studio generator) instead:
+
+```bat
+cmake -S . -B build ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DSTRATA_ENABLE_CUDA=ON ^
+  -DSTRATA_NATIVE_EXPERTS=ON ^
+  -DSTRATA_PORTABLE=ON ^
+  -DSTRATA_BUILD_TESTS=OFF
+cmake --build build --config Release --target unbiased-strata
+```
+
+Python/hf and the pack scripts are the same; only shell syntax and paths differ.
+
 ## Firewall
 
 UFW (if enabled):
