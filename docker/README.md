@@ -8,14 +8,12 @@ Provides **Langfuse** (tracing UI) + **LiteLLM** proxy in front of Strata.
 
 ## Configure
 
+Run from repo root:
 ```bash
-cd docker
-cp .env.example .env
-# edit .env:
-# - NEXTAUTH_SECRET: random secret for Langfuse
-# - SALT: another random salt
-# - LITELLM_MASTER_KEY: token clients use to call LiteLLM
+mise run obs:secrets
 ```
+
+This creates `docker/.env` with random `NEXTAUTH_SECRET`, `SALT`, and `LITELLM_MASTER_KEY` if it doesn't exist. Then edit `docker/.env` to add Langfuse keys after creating a project.
 
 ## Start
 
