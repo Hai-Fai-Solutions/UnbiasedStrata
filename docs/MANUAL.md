@@ -116,6 +116,8 @@ cmake --build build --config Release --target unbiased-strata
 
 Python/hf and the pack scripts are the same; only shell syntax and paths differ.
 
+The mise tasks now include `run_windows` variants for `build` and `serve:*`, but these Windows paths have **not yet been validated end-to-end**; treat them as a starting point.
+
 ## Firewall
 
 UFW (if enabled):
