@@ -44,3 +44,23 @@ depends = ["serve:start"]
 [tasks."mtp:serve:start-bg"]
 description = "Alias for serve:start-bg"
 depends = ["serve:start-bg"]
+
+[tasks."obs:up"]
+description = "Start Langfuse + LiteLLM observability stack"
+dir = "docker"
+run = "docker compose up -d"
+
+[tasks."obs:down"]
+description = "Stop observability stack"
+dir = "docker"
+run = "docker compose down"
+
+[tasks."obs:logs"]
+description = "Tail observability stack logs"
+dir = "docker"
+run = "docker compose logs -f"
+
+[tasks."obs:restart-litellm"]
+description = "Restart LiteLLM after updating .env keys"
+dir = "docker"
+run = "docker compose restart litellm"
