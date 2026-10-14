@@ -37,10 +37,12 @@ run = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -D
 [tasks."serve:start"]
 description = "Start Strata API server (foreground; use serve:start-bg for background)"
 run = "./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 2 --mtp-max-t 2"
+run_windows = "build\\Release\\unbiased-strata.exe --model \"$MODEL_DIR\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR\\qwen36-q4\" --mtp \"$MODEL_DIR\\qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 2 --mtp-max-t 2"
 
 [tasks."serve:start-bg"]
 description = "Start Strata API server in background, logging to strata.log"
 run = "nohup ./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 2 --mtp-max-t 2 > strata.log 2>&1 & echo $! > strata.pid"
+run_windows = "powershell -Command \"Start-Process -FilePath 'build\\Release\\unbiased-strata.exe' -ArgumentList '--model','$MODEL_DIR\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf','--pack','$MODEL_DIR\\qwen36-q4','--mtp','$MODEL_DIR\\qwen36-mtp-draft','--ctx','262144','--host','0.0.0.0','--port','8080','--','--kv','q4_0','--spec','2','--mtp-max-t','2' -RedirectStandardOutput 'strata.log' -RedirectStandardError 'strata.log'\""
 
 [tasks."mtp:serve:start"]
 description = "Alias for serve:start"
