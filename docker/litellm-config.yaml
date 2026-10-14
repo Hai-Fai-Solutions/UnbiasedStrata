@@ -10,4 +10,4 @@ litellm_settings:
   failure_callback: ["langfuse"]
 
 general_settings:
-  master_key: sk-local-litellm
+  master_key: os.environ/LITELLM_MASTER_KEY
