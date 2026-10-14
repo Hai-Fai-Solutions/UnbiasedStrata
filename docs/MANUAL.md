@@ -60,7 +60,7 @@ Access:
     "openai": {
       "package": "@opencode/ai/providers/openai-compatible",
       "settings": {
-        "baseURL": "http://192.168.1.42:8080/v1",
+        "baseURL": "http://<host-ip>:8080/v1",
         "apiKey": "local"
       },
       "models": {
