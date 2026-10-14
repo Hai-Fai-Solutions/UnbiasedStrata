@@ -11,6 +11,17 @@
 - [mise](https://mise.jdx.dev/installing-mise.html) (optional, but the mise tasks assume it)
 - Git, CMake, CUDA toolkit, Python 3, `hf` CLI
 
+## Why the MTP model
+
+Strata uses a **multi-token / MTP draft head** (cut from the `-MTP` GGUF) in addition to the trunk model. This enables speculative decoding: extra draft tokens are proposed and verified in parallel, improving generation throughput without changing output quality.
+
+Compared to a **single-model llama.cpp-style approach**, the MTP setup needs:
+- the main GGUF + a derived trunk pack
+- the MTP GGUF + a draft pack
+- slightly more RAM/VRAM planning (but gives materially faster decoding)
+
+If you do not want speculation, you can still run with `--spec 0`, but startup refuses `0` because the native pack path requires `spec >= 2`; tune with `--spec 2` for a memory-friendly balance.
+
 ## One-time setup
 
 1. Fetch models:
