@@ -1,5 +1,14 @@
 # secrets
 .env
 docker/.env
-# local env
 *.env.local
+
+# build artifacts
+build/
+models/
+*.log
+*.pid
+
+# python caches
+__pycache__/
+tools/__pycache__/
