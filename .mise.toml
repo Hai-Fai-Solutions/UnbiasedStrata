@@ -25,6 +25,10 @@ run = "python3 -I tools/mtp_qwen36_pack.py --gguf \"$MODEL_DIR/Qwen3.6-35B-A3B-U
 description = "Generate both trunk and draft packs"
 depends = ["packs:generate-trunk", "packs:generate-mtp"]
 
+[tasks."build"]
+description = "Build unbiased-strata"
+run = "make -C build"
+
 [tasks."serve:start"]
 description = "Start Strata API server (foreground; use serve:start-bg for background)"
 run = "./build/unbiased-strata --model \"$MODEL_DIR/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\" --pack \"$MODEL_DIR/qwen36-q4\" --mtp \"$MODEL_DIR/qwen36-mtp-draft\" --ctx 262144 --host 0.0.0.0 --port 8080 -- --kv q4_0 --spec 0 --mtp-max-t 0"
