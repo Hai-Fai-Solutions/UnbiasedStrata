@@ -1,7 +1,7 @@
 # UnbiasedStrata (PR feat/custom-model) — Operations Manual
 
 ## Prerequisites
-- Git checkout: `feat/custom-model`
+- This repo checked out in the branch that contains this manual (mise tasks and configs are provided there)
 - CUDA toolkit + CMake + make
 - Python 3, `hf` CLI, Hugging Face access
 - (Optional) Docker + docker compose, mise
@@ -48,20 +48,32 @@ Access:
 - OpenAI base URL: `http://<host>:8080/v1`
 - Model ID: `qwen3.6-35b-a3b-ud-q4_k_xl`
 
-## OpenCode configuration
+## OpenCode configuration (confirmed)
 
 ```json
 {
-  "provider": {
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "superpowers@git+https://github.com/obra/superpowers.git"
+  ],
+  "providers": {
     "openai": {
-      "options": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
         "baseURL": "http://192.168.1.42:8080/v1",
         "apiKey": "local"
       },
       "models": {
         "qwen3.6-35b-a3b-ud-q4_k_xl": {
-          "name": "Unbiased Strata Qwen3.6 UD-Q4_K_XL",
-          "options": { "temperature": 0.6, "top_p": 0.95, "max_tokens": 8192 }
+          "name": "Unbiased Strata Qwen3.6",
+          "settings": {
+            "temperature": 0.6,
+            "top_p": 0.95
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
         }
       }
     }
@@ -69,6 +81,8 @@ Access:
   "model": "openai/qwen3.6-35b-a3b-ud-q4_k_xl"
 }
 ```
+
+This configuration was verified against Strata using the OpenAI-compatible provider. Set `reasoning_effort` in request/model settings if you want thinking enabled (`"high"`), or omit/`"none"` for plain `content`.
 
 ## Observability stack (moved out)
 
