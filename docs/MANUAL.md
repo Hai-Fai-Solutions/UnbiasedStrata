@@ -6,6 +6,11 @@
 - Python 3, `hf` CLI, Hugging Face access
 - (Optional) Docker + docker compose, mise
 
+## Prerequisites (no Docker required for running Strata)
+
+- [mise](https://mise.jdx.dev/installing-mise.html) (optional, but the mise tasks assume it)
+- Git, CMake, CUDA toolkit, Python 3, `hf` CLI
+
 ## One-time setup
 
 1. Fetch models:
