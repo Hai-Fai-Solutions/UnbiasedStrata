@@ -70,29 +70,19 @@ Access:
 }
 ```
 
-## Observability stack (Langfuse + LiteLLM)
+## Observability stack (moved out)
 
-1. Copy env template and fill values:
-   ```bash
-   cp docker/.env.example docker/.env
-   ```
-2. Start:
-   ```bash
-   mise run obs:up
-   ```
-3. Open Langfuse at `http://localhost:3000`, create project, paste keys into `docker/.env`.
-4. Restart LiteLLM:
-   ```bash
-   mise run obs:restart-litellm
-   ```
-5. Point clients to LiteLLM instead:
-   - Base URL: `http://127.0.0.1:4000/v1`
-   - API key: `sk-local-litellm`
+The Langfuse + LiteLLM stack now lives in a separate repo:
+`../Strata-Observability` (see its `README.md`).
 
-Stop stack:
+Quickstart there:
 ```bash
-mise run obs:down
+cd ../Strata-Observability
+cp .env.example .env   # fill secrets + Langfuse keys
+docker compose up -d
 ```
+
+Point clients to LiteLLM (`http://<host>:4000/v1`) when enabled; otherwise use Strata directly at `:8080`.
 
 ## Firewall
 
